@@ -1,0 +1,101 @@
+# Virtuelle Umgebung
+venv/
+env/
+ENV/
+venv_*/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+jarvis.log
+
+# Lokale Konfiguration
+.env
+.env.local
+config.json  # Oft lokale Konfiguration, ggf. anpassen falls nötig
+config/encryption_key.key # Niemals Schlüssel einchecken!
+
+# Datenbanken und Indizes
+*.db
+*.sqlite3
+data/knowledge_base/chroma_db/
+data/chroma_test_db/
+test_chroma_db/
+test_dependencies.py/ # Sicher, dass das ein Ordner ist?
+test_llama.py/ # Sicher, dass das ein Ordner ist?
+test_local_implementations.py/ # Sicher, dass das ein Ordner ist?
+tests/test_chroma_db_persistent/
+data/learning/*.pkl # River-Modelle
+data/learning/*.migrated_by_script
+
+# Große Modelldateien
+data/models/
+# Ausnahmen für kleine Konfigurationsdateien in models könnten sinnvoll sein,
+# z.B.:
+# !data/models/tts/*.json
+# !data/models/whisper/**/config.json
+# !data/models/whisper/**/tokenizer.json
+# !data/models/whisper/**/vocabulary.txt
+# Aber Vorsicht bei generischen Ausnahmen!
+
+# Temporäre und generierte Daten
+data/audio/recordings/
+data/audio/current_recording.wav
+data/knowledge_import/
+data/conversations/*.enc # Verschlüsselte Konversationen? Eher nicht versionieren.
+data/safety/logs.json
+icon.ico # Generiert?
+*.onnx # Große Modelldateien
+
+# macOS / Windows
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints
+
+# Pakete (falls nicht schon oben abgedeckt)
+src/local_packages/
+
+# Test-Ausgaben (falls welche existieren)
+htmlcov/
+.tox/
+.nox/
+.coverage
+.cache
+nosetests.xml
+coverage.xml
+*,cover
+*.html
+.hypothesis/
+
+# Piper Ordner (enthält binaries und viele daten)
+piper/ 

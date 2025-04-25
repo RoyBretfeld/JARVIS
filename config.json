@@ -1,0 +1,52 @@
+{
+    "ollama": {
+        "url": "http://localhost:11434",
+        "model": "llama3:8b"
+    },
+    "audio": {
+        "selected_microphone": 1,
+        "sample_rate": 44100,
+        "channels": 1,
+        "chunk_size": 1024,
+        "microphone_index": "1",
+        "microphone_name": "Mikrofon (Moman EMP Microphone)",
+        "input_device": 1,
+        "output_device": 0
+    },
+    "whisper": {
+        "model_path": "data/models/whisper",
+        "model_type": "large-v2",
+        "language": "de",
+        "task": "transcribe"
+    },
+    "learning": {
+        "dir": "data/learning"
+    },
+    "piper": {
+        "path": "piper/piper.exe",
+        "model": "data/models/tts/de_DE-thorsten-high.onnx",
+        "config": "data/models/tts/de_DE-thorsten-high.onnx.json"
+    },
+    "prompt": {
+        "system_prompt": "Du bist JARVIS, ein KI-Assistent. Antworte immer auf Deutsch, auch bei englischen Fragen. \nHalte deine Antworten kurz und direkt. \nVermeide lange Erkl\u00e4rungen und technische Details. \nBleibe nat\u00fcrlich und freundlich.\nErkl\u00e4re nicht immer wieder wer du bist und wo du vielleicht herkommst, ich hab Dich geschrieben und nur der Name ist mit Tony Starks Kreation gleich, ansonsten nichts."
+    },
+    "llm": {
+        "provider": "ollama",
+        "model": "llama3:8b",
+        "system_prompt": "Du bist JARVIS, ein KI-Assistent. Antworte immer auf Deutsch, auch bei englischen Fragen. Halte deine Antworten kurz und direkt. Vermeide lange Erkl\u00e4rungen und technische Details. Bleibe nat\u00fcrlich und freundlich."
+    },
+    "tts": {
+        "model": "de_DE-thorsten-high",
+        "speaker": 0,
+        "speed": 1.0,
+        "enable_tts": true,
+        "engine": "piper",
+        "speaker_wav_path": ""
+    },
+    "weather": {
+        "api_key": "91ee2d32a13be6a0c1086c8539f8dcf5",
+        "city": "Dresden,01139,DE",
+        "units": "metric",
+        "language": "de"
+    }
+}

@@ -1,0 +1,13 @@
+formatters:
+  standard:
+    format: '%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+handlers:
+  file:
+    class: logging.FileHandler
+    filename: data/system/logs/jarvis.log
+    formatter: standard
+root:
+  handlers:
+  - file
+  level: INFO
+version: 1

@@ -1,0 +1,13 @@
+gui:
+  dashboard_widgets:
+  - weather
+  - calendar
+  - system_status
+  theme: dark
+nlp:
+  context_memory_size: 5
+  model: spacy_de_core_news_lg
+speech:
+  language: de-DE
+  voice_id: default
+  wake_word: Jarvis

@@ -1,0 +1,33 @@
+{
+    "blocked_commands": [
+        "rm -rf",
+        "del",
+        "shutdown",
+        "reboot",
+        "sudo",
+        "chmod",
+        "chown"
+    ],
+    "sensitive_patterns": [
+        "password",
+        "key",
+        "token",
+        "secret",
+        "[0-9]{16}",
+        "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Z|a-z]{2,}"
+    ],
+    "max_violations": 3,
+    "violation_timeout": 3600,
+    "safety_rules": [
+        {
+            "name": "Netzwerkzugriff",
+            "pattern": "http|ftp|ssh|telnet",
+            "severity": "medium"
+        },
+        {
+            "name": "Dateioperationen",
+            "pattern": "file|open|write|delete",
+            "severity": "medium"
+        }
+    ]
+}

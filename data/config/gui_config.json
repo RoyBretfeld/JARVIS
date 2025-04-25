@@ -1,0 +1,11 @@
+{
+    "microphone": {
+        "index": 8,
+        "name": "Mikrofon (2- Logitech G935/G933"
+    },
+    "audio": {
+        "sample_rate": 44100,
+        "channels": 1,
+        "chunk_size": 1024
+    }
+}
