@@ -143,6 +143,18 @@ class LLMManager:
             return False
         return self.current_provider.check_connection()
         
+    def get_current_system_prompt(self) -> str:
+        """Gibt den aktuellen System-Prompt des aktiven Providers zurück."""
+        if self.current_provider and hasattr(self.current_provider, 'system_prompt'):
+            # Gebe den Prompt des Providers zurück, oder den Standard-Fallback, wenn er None ist
+            return self.current_provider.system_prompt or "Du bist JARVIS, ein hilfreicher KI-Assistent. Antworte immer auf Deutsch."
+        elif self.current_provider:
+            logger.warning(f"Aktiver Provider '{self.current_provider.name}' hat kein 'system_prompt' Attribut.")
+            return "" # Leerer String oder Standard-Prompt?
+        else:
+            logger.warning("Kein aktiver Provider, kann System-Prompt nicht abrufen.")
+            return "" # Leerer String oder Standard-Prompt?
+        
     def load_prompts(self) -> dict:
         """Lädt die Prompts aus der JSON-Datei"""
         try:
@@ -253,8 +265,12 @@ class LLMManager:
                 return response
                 
             except Exception as e:
-                error_msg = f"Fehler bei der Textverarbeitung: {str(e)}"
+                # Korrigierter Fehler: Verwende festen String statt self.log_prefix
+                error_msg = f"[LLMManager] Fehler bei der Textverarbeitung: {e}" 
                 logger.error(error_msg)
+                # Stelle sicher, dass traceback importiert ist (sollte oben sein)
+                import traceback 
+                logger.error(traceback.format_exc()) 
                 return "Entschuldigung, ich konnte deine Anfrage nicht verarbeiten."
                 
         except Exception as e:
@@ -399,19 +415,23 @@ class LLMManager:
             return None 
 
     def update_system_prompt(self, new_prompt: str):
-        """Aktualisiert den System-Prompt für den LLM."""
-        try:
-            if self.current_provider:
+        """Aktualisiert den System-Prompt im Manager und im aktiven Provider."""
+        logger.info(f"Aktualisiere System-Prompt im LLMManager...")
+        # Hier könnten wir auch self.prompts aktualisieren und speichern,
+        # aber das Wichtigste ist, den Provider zu informieren.
+        if self.current_provider and hasattr(self.current_provider, 'update_system_prompt'):
+            try:
                 self.current_provider.update_system_prompt(new_prompt)
-                logger.info("System-Prompt erfolgreich aktualisiert")
-            else:
-                logger.error("Kein LLM-Provider verfügbar für Prompt-Update")
-        except Exception as e:
-            logger.error(f"Fehler beim Aktualisieren des System-Prompts: {str(e)}")
-            raise 
-
+                logger.info("System-Prompt erfolgreich an den aktiven Provider weitergegeben.")
+            except Exception as e:
+                logger.error(f"Fehler beim Weitergeben des System-Prompts an den Provider: {e}", exc_info=True)
+        elif not self.current_provider:
+            logger.warning("Kein aktiver Provider zum Aktualisieren des System-Prompts vorhanden.")
+        else: # Provider existiert, aber hat keine update_system_prompt Methode
+            logger.warning(f"Aktiver Provider '{self.current_provider.name}' unterstützt das Aktualisieren des System-Prompts nicht.")
+        
     def ask_llm(self, prompt: str) -> str:
-        """Fragt das lokale LLM Hermes nach einer Antwort auf den gegebenen Prompt."""
+        """Sendet einen einfachen Prompt an das LLM (für interne Zwecke)."""
         return query_hermes(prompt) 
 
     def set_online_mode(self, is_online: bool) -> bool:

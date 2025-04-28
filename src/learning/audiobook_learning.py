@@ -37,7 +37,7 @@ learning_manager_instance: LearningManager = None
 
 # Konstanten
 AUDIOBOOK_TEMP_DIR = "data/temp/audiobook_processing"
-CHUNK_LENGTH_MS = 10000  # 10 Sekunden pro Chunk
+CHUNK_LENGTH_MS = 60000  # 60 Sekunden pro Chunk
 TARGET_SAMPLE_RATE = 16000 # 16kHz für Whisper
 PROCESSED_FILES_LOG = os.path.join(AUDIOBOOK_TEMP_DIR, "processed_files.log")
 

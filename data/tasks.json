@@ -1,0 +1,15 @@
+[
+    {
+        "id": "a1e34698-aa6d-49dc-acb4-451f2b71c018",
+        "description": "Erste Aufgabe erstellen",
+        "status": "done",
+        "created_at": "2025-04-26T23:38:12.152188",
+        "completed_at": "2025-04-26T23:38:12.153188"
+    },
+    {
+        "id": "4434ae6b-9498-497f-8677-6907f92906ce",
+        "description": "Instagram Post Idee generieren",
+        "status": "open",
+        "created_at": "2025-04-26T23:38:12.153188"
+    }
+]

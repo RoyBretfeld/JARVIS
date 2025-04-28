@@ -1,77 +1,24 @@
 import json
 import os
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, 
-                             QTextEdit, QListWidget, QLabel, QMessageBox, QGroupBox, QDialogButtonBox)
+                             QTextEdit, QListWidget, QLabel, QMessageBox, QGroupBox, QDialogButtonBox, QInputDialog)
 from PyQt6.QtCore import Qt
 
 class PromptEditor(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, prompts_file: str, parent=None):
         super().__init__(parent)
+        self.prompts_file = prompts_file
         self.setWindowTitle("System-Prompt Editor")
         self.setModal(True)
-        self.setup_ui()
         
-    def setup_ui(self):
-        """Initialisiert die Benutzeroberfläche des Editors."""
-        layout = QVBoxLayout(self)
+        # Lade Prompts zuerst
+        self.current_prompts = self.load_prompts()
         
-        # Erklärungstext
-        info_label = QLabel("Bearbeiten Sie hier den System-Prompt für JARVIS:")
-        layout.addWidget(info_label)
+        # Rufe die KORREKTE UI-Initialisierungsmethode auf
+        self.init_ui() 
         
-        # Texteditor
-        self.prompt_edit = QTextEdit()
-        self.prompt_edit.setMinimumSize(600, 400)
-        self.prompt_edit.setStyleSheet("""
-            QTextEdit {
-                background-color: #2d2d2d;
-                color: #ffffff;
-                border: 1px solid #3d3d3d;
-                border-radius: 4px;
-                padding: 5px;
-            }
-        """)
-        layout.addWidget(self.prompt_edit)
-        
-        # Buttons
-        button_box = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | 
-            QDialogButtonBox.StandardButton.Cancel
-        )
-        button_box.accepted.connect(self.accept)
-        button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
-        
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #1a1a1a;
-                color: #ffffff;
-            }
-            QLabel {
-                color: #ffffff;
-            }
-            QPushButton {
-                background-color: #2d2d2d;
-                color: #ffffff;
-                border: 1px solid #3d3d3d;
-                padding: 5px 15px;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #3d3d3d;
-            }
-        """)
-        
-    def set_prompt(self, prompt: str):
-        """Setzt den aktuellen Prompt im Editor."""
-        self.prompt_edit.setText(prompt)
-        
-    def get_prompt(self) -> str:
-        """Gibt den aktuellen Prompt aus dem Editor zurück."""
-        return self.prompt_edit.toPlainText().strip()
-
     def init_ui(self):
-        """Initialisiert die Benutzeroberfläche"""
+        """Initialisiert die Benutzeroberfläche (die detaillierte Ansicht)"""
         layout = QHBoxLayout()
         
         # Linke Seite - Regelliste

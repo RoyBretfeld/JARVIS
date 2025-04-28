@@ -73,14 +73,16 @@ class MicrophoneSelector(QDialog):
             # Nur Eingabegeräte anzeigen
             if device_info['maxInputChannels'] > 0:
                 item = QListWidgetItem(f"{device_info['name']}")
-                item.setData(Qt.UserRole, i)  # Speichere Device-Index
+                # Speichere Device-Index (PyQt6 Syntax)
+                item.setData(Qt.ItemDataRole.UserRole, i)  
                 self.device_list.addItem(item)
                 
         p.terminate()
         
-    def get_selected_microphone(self):
+    def get_selected_device_index(self): # Umbenannt für Klarheit
         """Gibt den Index des ausgewählten Mikrofons zurück"""
         current_item = self.device_list.currentItem()
         if current_item:
-            return current_item.data(Qt.UserRole)
+            # Hole Daten mit neuer PyQt6 Syntax
+            return current_item.data(Qt.ItemDataRole.UserRole)
         return None 

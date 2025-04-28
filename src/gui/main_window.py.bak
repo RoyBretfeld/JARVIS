@@ -1,0 +1,2105 @@
+import os
+import sys
+import soundfile as sf
+import numpy as np
+from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                           QLabel, QPushButton, QFrame, QComboBox, QDialog,
+                           QScrollArea, QTextEdit, QMessageBox, QProgressDialog, 
+                           QGroupBox, QStatusBar, QFileDialog, QListWidget, QDialogButtonBox, QProgressBar,
+                           QApplication, QSplitter, QLineEdit, QStyle, QCheckBox,
+                           QInputDialog, QListWidgetItem)
+from PyQt6.QtCore import Qt, QDateTime, QTimer, QThread, pyqtSignal, QMetaObject, Q_ARG, QSize, pyqtSlot, QObject
+from PyQt6.QtGui import QPalette, QColor, QFont, QPainter, QPen, QIcon, QTextCursor
+import threading
+import queue
+from datetime import datetime
+from config import Config
+import time
+import io
+from ..utils.system_monitor import SystemMonitor
+from .debug_monitor import DebugMonitor
+from ..llm.llm_manager import LLMManager
+from ..llm.learning_manager import LearningManager
+from ..learning.river_learning_manager import RiverLearningManager
+from .mic_selector import MicrophoneSelector
+from ..audio.audio_thread import AudioProcessThread
+import requests
+from .prompt_editor import PromptEditor
+from ..audio.audio_processor import AudioProcessor
+from .loading_screen import LoadingScreen
+# Entferne alten Import
+# from ..audio.tts_manager import TTSManager
+# Importiere die Factory und die Basisklasse (für Type Hinting, optional)
+from ..audio.base_tts_manager import BaseTTSManager, create_tts_manager
+import traceback
+import shutil
+from typing import List, Dict, Optional
+import logging
+import pyaudio
+import math # Import math für Umrechnung
+import platform
+import psutil
+import uuid
+# Importiere die Audiobook-Verarbeitungsfunktion
+from ..learning.audiobook_learning import find_and_process_audio_in_folder
+# Import WhisperRecognizer für Type Hinting im AudiobookImportThread
+from ..speech.whisper_recognition import WhisperRecognizer
+# Korrigierter Import für StatusWidget
+from .widgets.status_widget import StatusWidget
+from .audio_settings_widget import AudioSettingsWidget # Import new widget
+from src.tasks.task_manager import TaskManager # Ensure TaskManager is imported
+
+# Logger für dieses Modul holen (wird durch jarvis.py konfiguriert)
+logger = logging.getLogger(__name__)
+
+# Logging konfigurieren (ENTFERNT)
+# logging.basicConfig(...)
+
+# Konstante für DB Pfad (relativ zum Workspace Root)
+CHROMA_DB_DISPLAY_PATH = "data/knowledge_base/chroma_db"
+
+# Hilfsfunktion
+def get_directory_size(directory):
+    """Berechnet die Gesamtgröße eines Verzeichnisses in Kilobyte."""
+    total_size = 0
+    try:
+        if not os.path.exists(directory):
+            logger.info(f"Verzeichnis nicht gefunden: {directory}")
+            return 0.0
+        for dirpath, dirnames, filenames in os.walk(directory):
+            for f in filenames:
+                fp = os.path.join(dirpath, f)
+                if not os.path.islink(fp):
+                    try:
+                        total_size += os.path.getsize(fp)
+                    except OSError as e:
+                        logger.warning(f"Konnte Größe von {fp} nicht lesen: {e}")
+                        pass
+    except Exception as e:
+        logger.error(f"Fehler beim Berechnen der Verzeichnisgröße '{directory}': {e}")
+        return -1.0
+
+    return total_size / 1024 if total_size > 0 else 0.0  # Konvertiere zu KB
+
+class AudioVisualizer(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.audio_data = np.zeros(100)
+        self.audio_buffer = None  # Buffer für die Aufnahme
+        self.is_recording = False
+        self.update_timer = QTimer()
+        self.update_timer.timeout.connect(self.update)
+        self.update_timer.start(50)  # 20 FPS
+        
+        # Wiedergabe-Variablen
+        self.is_playing = False
+        self.playback_thread = None
+        self.p = None
+        self.stream = None
+        self.stop_playback = False
+        
+    def update_audio_data(self, data):
+        """Aktualisiert die Audiodaten für die Visualisierung"""
+        self.audio_data = data
+        
+    def paintEvent(self, event):
+        """Zeichnet die Audio-Visualisierung"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # Setze die Zeichenfarbe basierend auf dem Status
+        if self.is_recording:
+            color = QColor("#ff4444")  # Rot während der Aufnahme
+        elif self.is_playing:
+            color = QColor("#00ff00")  # Grün während der Wiedergabe
+        else:
+            color = QColor("#00ff00")  # Standard grün
+            
+        painter.setPen(QPen(color, 2))
+        
+        # Berechne die Skalierung
+        width = self.width()
+        height = self.height()
+        center_y = height / 2
+        
+        # Zeichne die Wellenform
+        for i in range(len(self.audio_data) - 1):
+            x1 = (i / len(self.audio_data)) * width
+            x2 = ((i + 1) / len(self.audio_data)) * width
+            
+            y1 = center_y + (self.audio_data[i] * height / 2)
+            y2 = center_y + (self.audio_data[i + 1] * height / 2)
+            
+            painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+    
+    def start_recording(self):
+        """Startet die Aufnahme"""
+        self.is_recording = True
+        self.audio_buffer = None
+        self.update()
+    
+    def stop_recording(self):
+        """Stoppt die Aufnahme"""
+        self.is_recording = False
+        self.update()
+    
+    def play_recording(self):
+        """Gibt die Aufnahme wieder"""
+        if self.audio_buffer is None or self.is_playing:
+            return
+            
+        self.is_playing = True
+        self.update()
+        
+        # Starte Wiedergabe-Thread
+        self.playback_thread = threading.Thread(target=self._play_audio)
+        self.playback_thread.daemon = True
+        self.playback_thread.start()
+    
+    def _play_audio(self):
+        """Wiedergabe der Audio-Daten in einem separaten Thread"""
+        try:
+            self.p = pyaudio.PyAudio()
+            
+            self.stream = self.p.open(format=pyaudio.paInt16,
+                                    channels=1,
+                                    rate=44100,
+                                    output=True,
+                                    frames_per_buffer=2048)
+            
+            if not isinstance(self.audio_buffer, np.ndarray):
+                logger.info("Konvertiere Audio-Buffer zu NumPy Array")
+                self.audio_buffer = np.array(self.audio_buffer, dtype=np.int16)
+            
+            chunk_size = 2048
+            total_samples = len(self.audio_buffer)
+            
+            for i in range(0, total_samples, chunk_size):
+                if self.stop_playback:
+                    logger.info("Wiedergabe wird gestoppt")
+                    break
+                
+                chunk = self.audio_buffer[i:min(i + chunk_size, total_samples)]
+                
+                if len(chunk) > 0:
+                    self.stream.write(chunk.tobytes())
+            
+            logger.info("Wiedergabe beendet")
+            
+        except Exception as e:
+            logger.error(f"Fehler bei der Wiedergabe: {str(e)}")
+        finally:
+            if hasattr(self, 'stream') and self.stream is not None:
+                try:
+                    self.stream.stop_stream()
+                    self.stream.close()
+                    self.stream = None
+                except Exception as e:
+                    logger.error(f"Fehler beim Schließen des Streams: {str(e)}")
+            
+            if hasattr(self, 'p') and self.p is not None:
+                try:
+                    self.p.terminate()
+                    self.p = None
+                except Exception as e:
+                    logger.error(f"Fehler beim Beenden von PyAudio: {str(e)}")
+            
+            self.is_playing = False
+            self.stop_playback = False
+            self.update()
+    
+    def stop_playing(self):
+        """Stoppt die Wiedergabe"""
+        try:
+            self.stop_playback = True
+            if hasattr(self, 'stream') and self.stream is not None:
+                self.stream.stop_stream()
+                self.stream.close()
+                self.stream = None
+            self.is_playing = False
+            self.update()
+        except Exception as e:
+            logger.error(f"Fehler beim Stoppen der Wiedergabe: {str(e)}")
+            self.is_playing = False
+            self.update()
+
+class MicrophoneSelector(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Mikrofon auswählen")
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #1a1a1a;
+                color: #ffffff;
+            }
+            QComboBox {
+                background-color: #2d2d2d;
+                color: #ffffff;
+                border: 1px solid #3d3d3d;
+                padding: 5px;
+                border-radius: 4px;
+            }
+            QPushButton {
+                background-color: #2d2d2d;
+                color: #ffffff;
+                border: 1px solid #3d3d3d;
+                padding: 8px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #3d3d3d;
+            }
+        """)
+        
+        layout = QVBoxLayout(self)
+        
+        # Mikrofon-Auswahl
+        self.mic_combo = QComboBox()
+        self.populate_microphones()
+        layout.addWidget(QLabel("Verfügbare Mikrofone:"))
+        layout.addWidget(self.mic_combo)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        ok_button = QPushButton("OK")
+        cancel_button = QPushButton("Abbrechen")
+        
+        ok_button.clicked.connect(self.accept)
+        cancel_button.clicked.connect(self.reject)
+        
+        button_layout.addWidget(ok_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+        
+        self.setMinimumWidth(300)
+    
+    def populate_microphones(self):
+        """Füllt die ComboBox mit verfügbaren und funktionierenden Mikrofonen"""
+        p = pyaudio.PyAudio()
+        working_mics = []
+        
+        for i in range(p.get_device_count()):
+            try:
+                device_info = p.get_device_info_by_index(i)
+                if device_info.get('maxInputChannels') > 0:
+                    test_stream = p.open(
+                        format=pyaudio.paInt16,
+                        channels=1,
+                        rate=44100,
+                        input=True,
+                        input_device_index=i,
+                        frames_per_buffer=2048,
+                        start=False
+                    )
+                    test_stream.close()
+                    
+                    name = device_info.get('name', f"Unbekanntes Gerät {i}")
+                    working_mics.append((name, i))
+                    logger.info(f"Funktionierendes Mikrofon gefunden - Name: {name}, Index: {i}")
+            except Exception as e:
+                logger.warning(f"Mikrofon {i} nicht verfügbar: {str(e)}")
+                continue
+        
+        seen_names = set()
+        for name, index in working_mics:
+            if name not in seen_names:
+                seen_names.add(name)
+                self.mic_combo.addItem(name, index)
+                
+        p.terminate()
+        
+        if self.mic_combo.count() == 0:
+            logger.warning("Keine funktionierenden Mikrofone gefunden")
+            
+    def get_selected_microphone(self):
+        """Gibt den Index des ausgewählten Mikrofons zurück"""
+        return self.mic_combo.currentData()
+
+class ModelLoaderThread(QThread):
+    """Thread zum Laden des Whisper-Modells mit GPU-Optimierung"""
+    finished = pyqtSignal(object)  # Sendet das geladene Modell
+    error = pyqtSignal(str)        # Sendet Fehlermeldungen
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        
+    def run(self):
+        """Lädt das Whisper-Modell im Hintergrund"""
+        try:
+            # Add the import statement here
+            from ..speech.whisper_recognition import WhisperRecognizer
+            
+            # Initialisiere WhisperRecognizer mit optimierten Einstellungen
+            recognizer = WhisperRecognizer(
+                model_size="large-v2",
+                device="cuda",
+                compute_type="float16",
+                cache_dir="data/models/whisper"
+            )
+            
+            # Sende das initialisierte Modell zurück
+            self.finished.emit(recognizer)
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(f"Fehler beim Laden des Whisper-Modells: {str(e)}")
+
+class AudioProcessThread(QThread):
+    """Thread für die Audioaufnahme und -verarbeitung."""
+    finished = pyqtSignal(bytes)  # Signal für fertige Audiodaten
+    update_visualization = pyqtSignal(np.ndarray)  # Signal für Audio-Visualisierung
+    
+    def __init__(self, chunk_size, format, channels, rate, device_index, parent=None):
+        super().__init__(parent)
+        self.chunk_size = chunk_size
+        self.format = format
+        self.channels = channels
+        self.rate = rate
+        self.device_index = device_index
+        self.is_recording = False
+        self.frames = []
+        self._stop_event = threading.Event()  # Event zum Stoppen des Threads
+        self.log_prefix = "[AudioProcessThread]"
+        self.response_id = str(uuid.uuid4())  # Generiere eine eindeutige ID für diese Antwort
+        
+    def stop(self):
+        """Stoppt den Thread sicher."""
+        logger.info(f"{self.log_prefix} Stoppe Aufnahme...")
+        self._stop_event.set()
+        self.is_recording = False
+    
+    def run(self):
+        try:
+            logger.info(f"{self.log_prefix} Starte Audioaufnahme...")
+            p = pyaudio.PyAudio()
+            stream = p.open(
+                format=self.format,
+                channels=self.channels,
+                rate=self.rate,
+                input=True,
+                input_device_index=self.device_index,
+                frames_per_buffer=self.chunk_size
+            )
+            
+            logger.info(f"{self.log_prefix} Stream erfolgreich geöffnet")
+            
+            start_time = time.time()
+            MAX_RECORDING_TIME = 20  # Maximale Aufnahmezeit in Sekunden
+            
+            while self.is_recording and not self._stop_event.is_set():
+                if time.time() - start_time >= MAX_RECORDING_TIME:
+                    logger.info(f"{self.log_prefix} Maximale Aufnahmezeit erreicht")
+                    self.is_recording = False
+                    break
+                    
+                try:
+                    data = stream.read(self.chunk_size, exception_on_overflow=False)
+                    self.frames.append(data)
+                    
+                    # Sende Daten für Visualisierung
+                    chunk_data = np.frombuffer(data, dtype=np.int16)
+                    normalized_data = chunk_data.astype(np.float32) / 32768.0
+                    self.update_visualization.emit(normalized_data)
+                except Exception as e:
+                    logger.error(f"{self.log_prefix} Fehler beim Lesen des Streams: {str(e)}")
+                    break
+            
+            # Aufnahme beenden
+            if stream:
+                stream.stop_stream()
+                stream.close()
+            if p:
+                p.terminate()
+            
+            # Sende fertige Aufnahme
+            if self.frames:
+                audio_data = b''.join(self.frames)
+                logger.info(f"{self.log_prefix} Aufnahme beendet, {len(audio_data)} Bytes aufgenommen")
+                self.finished.emit(audio_data)
+            else:
+                logger.warning(f"{self.log_prefix} Keine Audiodaten aufgenommen")
+                self.finished.emit(None)
+            
+        except Exception as e:
+            error_msg = f"{self.log_prefix} Fehler bei der Audioaufnahme: {str(e)}"
+            logger.error(error_msg)
+            self.finished.emit(None)
+
+class ProcessingThread(QThread):
+    """Führt die Audioverarbeitung, Transkription und LLM-Anfrage im Hintergrund aus."""
+    update_chat = pyqtSignal(str, str, str)  # Hinzugefügt: response_id als dritter Parameter
+    trigger_tts = pyqtSignal(str)
+    processing_finished = pyqtSignal(bool, str)
+    transcription_result = pyqtSignal(str)
+
+    def __init__(self, audio_data, audio_processor, whisper_recognizer, llm_manager, config, learning_manager, river_learning_manager, parent=None):
+        super().__init__(parent)
+        self.audio_data = audio_data
+        self.audio_processor = audio_processor
+        self.whisper_recognizer = whisper_recognizer
+        self.llm_manager = llm_manager
+        self.config = config
+        self.learning_manager = learning_manager
+        self.river_learning_manager = river_learning_manager # Store instance
+        self.log_prefix = "[ProcessingThread]"
+        self.response_id = str(uuid.uuid4())  # Generiere eine eindeutige ID für diese Antwort
+
+    def run(self):
+        """Führt die Verarbeitungsschritte aus."""
+        success = False
+        result_or_error = "Unbekannter Fehler"
+        try:
+            logger.info(f"{self.log_prefix} Gestartet mit {len(self.audio_data)} Bytes Audio.")
+
+            # --- Schritt 1: Audio verarbeiten --- 
+            logger.info(f"{self.log_prefix} Rufe audio_processor.process_audio auf...")
+            if not self.audio_processor:
+                raise ValueError("AudioProcessor ist nicht initialisiert")
+            processed_data, sample_rate = self.audio_processor.process_audio(self.audio_data)
+            if processed_data is None or len(processed_data) == 0:
+                raise ValueError("AudioProcessor hat keine Daten zurückgegeben.")
+            logger.info(f"{self.log_prefix} Audio verarbeitet. Sample Rate: {sample_rate}, Datenlänge: {len(processed_data)}")
+
+            # --- Schritt 2: WAV speichern --- 
+            save_dir = os.path.join(self.config.get('AUDIO', 'recordings_path', fallback='data/audio/recordings'))
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, "current_recording.wav")
+            logger.info(f"{self.log_prefix} Speichere WAV nach: {save_path}")
+            sf.write(save_path, processed_data, sample_rate)
+            logger.info(f"{self.log_prefix} WAV-Datei erfolgreich gespeichert.")
+
+            # --- Schritt 3: Whisper Transkription --- 
+            if not self.whisper_recognizer:
+                 raise RuntimeError("Whisper Recognizer ist nicht initialisiert.")
+            logger.info(f"{self.log_prefix} Rufe whisper_recognizer.transcribe_wav auf...")
+            transcript = self.whisper_recognizer.transcribe_wav(save_path)
+            if transcript is None:
+                 raise RuntimeError("Whisper hat kein Transkript zurückgegeben.")
+            logger.info(f"{self.log_prefix} Whisper Transkription erfolgreich: '{transcript}'")
+            
+            # Sende Transkript über das dedizierte Signal
+            self.transcription_result.emit(transcript)
+
+            # --- Schritt 3.5: Predict intent with River --- 
+            if self.river_learning_manager:
+                try:
+                    intent_prediction = self.river_learning_manager.predict(transcript)
+                    logger.info(f"{self.log_prefix} River Intent Prediction: '{intent_prediction}' for '{transcript}'")
+                    # Store context for potential learning
+                    if hasattr(self.parent(), 'interaction_context'):
+                        self.parent().interaction_context[self.response_id] = {"user_input": transcript, "river_prediction": intent_prediction}
+                    # TODO: Use the prediction later (e.g., adapt prompt?)
+                except Exception as river_e:
+                    logger.warning(f"{self.log_prefix} River prediction failed: {river_e}")
+            else:
+                logger.warning(f"{self.log_prefix} RiverLearningManager not available for prediction.")
+
+            # --- Schritt 4: LLM Anfrage --- 
+            if not self.llm_manager:
+                raise RuntimeError("LLM Manager ist nicht initialisiert.")
+            logger.info(f"{self.log_prefix} Rufe llm_manager.process_text auf...")
+            llm_response = self.llm_manager.process_text(transcript)
+            if not llm_response:
+                raise RuntimeError("LLM hat keine Antwort zurückgegeben.")
+            logger.info(f"{self.log_prefix} LLM Antwort erhalten: '{llm_response[:100]}...'")
+            
+            # Sende LLM Antwort an GUI mit der Antwort-ID
+            self.update_chat.emit("JARVIS", llm_response, self.response_id)
+            
+            # Trigger TTS wenn aktiviert
+            try:
+                if self.config and self.config.get('tts', 'enable_tts', fallback=False):
+                    self.trigger_tts.emit(llm_response)
+                    logger.debug(f"{self.log_prefix} TTS Signal gesendet für Antwort.")
+                else:
+                    logger.debug(f"{self.log_prefix} TTS ist in der Konfiguration deaktiviert oder Config-Objekt fehlt.")
+            except Exception as e:
+                logger.error(f"{self.log_prefix} Fehler beim Prüfen der TTS-Konfiguration oder beim Senden des Signals: {e}", exc_info=True)
+
+            # Speichere die Antwort-ID im LearningManager
+            if self.learning_manager:
+                try:
+                    self.learning_manager.add_entry(
+                        doc_id=self.response_id,
+                        content=llm_response,
+                        metadata={
+                            "entry_type": "response",
+                            "timestamp": datetime.now().isoformat(),
+                            "question": transcript
+                        }
+                    )
+                    logger.info(f"{self.log_prefix} Antwort mit ID {self.response_id} gespeichert")
+                except Exception as e:
+                    logger.error(f"{self.log_prefix} Fehler beim Speichern der Antwort-ID: {e}")
+            
+            success = True
+            result_or_error = llm_response
+
+        except Exception as e:
+            logger.error(f"{self.log_prefix} Fehler in der Verarbeitung: {e}")
+            traceback.print_exc()
+            result_or_error = f"Fehler im ProcessingThread: {str(e)}"
+            success = False
+            try:
+                self.update_chat.emit("System", result_or_error, self.response_id)
+            except Exception as emit_error:
+                logger.error(f"{self.log_prefix} Fehler beim Senden der Fehlermeldung: {emit_error}")
+                self.update_chat.emit("System", f"Fehler bei der Verarbeitung: Ein interner Fehler ist aufgetreten")
+
+        finally:
+            logger.info(f"{self.log_prefix} Verarbeitung beendet (Success: {success}).")
+            self.processing_finished.emit(success, result_or_error)
+
+    def on_update_chat(self, sender: str, message: str, response_id: str = None):
+        """Aktualisiert den Chat-Bereich mit einer neuen Nachricht."""
+        try:
+            if hasattr(self, 'chat_area'):
+                # Formatierung der Nachricht
+                timestamp = QDateTime.currentDateTime().toString("HH:mm:ss")
+                formatted_message = f"[{timestamp}] {sender}: {message}\n"
+                
+                # Füge die Nachricht zum Chat-Bereich hinzu
+                self.chat_area.append(formatted_message)
+                
+                # Aktiviere Feedback-Buttons nur für JARVIS-Antworten
+                if sender == "JARVIS":
+                    # Speichere die Antwort-ID
+                    self.last_response_id = response_id
+                    if response_id:
+                        logger.info(f"Antwort-ID {response_id} für Feedback gespeichert")
+                        self.thumbs_up_button.setEnabled(True)
+                        self.thumbs_down_button.setEnabled(True)
+                    else:
+                        logger.warning("Keine Antwort-ID für JARVIS-Antwort erhalten")
+                        self.thumbs_up_button.setEnabled(False)
+                        self.thumbs_down_button.setEnabled(False)
+                else:
+                    # Deaktiviere Feedback-Buttons für andere Sender
+                    self.thumbs_up_button.setEnabled(False)
+                    self.thumbs_down_button.setEnabled(False)
+                
+                # Scrolle zum Ende
+                cursor = self.chat_area.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                self.chat_area.setTextCursor(cursor)
+                
+                logger.debug(f"Chat aktualisiert: {sender} - {message[:50]}...")
+        except Exception as e:
+            logger.error(f"Fehler beim Aktualisieren des Chats: {str(e)}")
+
+    def send_feedback(self, is_positive: bool):
+        """Sendet Feedback für die letzte Antwort."""
+        try:
+            if not self.last_response_id:
+                logger.warning("Keine Antwort-ID für Feedback verfügbar")
+                return
+                
+            logger.info(f"Sende Feedback für Antwort-ID {self.last_response_id}")
+            
+            # --- River Learning Integration ---
+            if is_positive and self.river_learning_manager:
+                if self.last_response_id in self.interaction_context:
+                    context = self.interaction_context[self.last_response_id]
+                    user_input = context.get("user_input")
+                    river_prediction = context.get("river_prediction")
+                    
+                    # Learn if input exists and prediction was made (even if prediction is None)
+                    if user_input is not None and "river_prediction" in context: 
+                        try:
+                            self.river_learning_manager.learn(user_input, river_prediction)
+                            logger.info(f"River Learning: Called learn for ID {self.last_response_id} with input '{user_input[:50]}...' and label '{river_prediction}'")
+                        except Exception as learn_e:
+                            logger.error(f"River Learning: Error calling learn for ID {self.last_response_id}: {learn_e}")
+                    else:
+                        logger.warning(f"River Learning: Skipping learn for ID {self.last_response_id} due to missing input or prediction context.")
+                        
+                    # Optional: Remove context after feedback to prevent re-learning
+                    # del self.interaction_context[self.last_response_id]
+                else:
+                     logger.warning(f"River Learning: Skipping learn for ID {self.last_response_id} - context not found.")
+            # --- End River Learning Integration ---
+            
+            # --- Negative Feedback Handling for River ---
+            elif not is_positive and self.river_learning_manager:
+                 if self.last_response_id in self.interaction_context:
+                    context = self.interaction_context[self.last_response_id]
+                    user_input = context.get("user_input")
+                    river_prediction = context.get("river_prediction") # Get the prediction that was made
+                    
+                    if user_input is not None:
+                        # Ask user for the correct intent
+                        correct_label, ok = QInputDialog.getText(self, 
+                                                               'Feedback zur Absicht',
+                                                               f'Die Vorhersage war "{river_prediction}". Was war die korrekte Absicht für:\n\"{user_input[:80]}...\"?')
+                        
+                        if ok and correct_label:
+                            # User provided a correct label, learn with it
+                            try:
+                                self.river_learning_manager.learn(user_input, correct_label)
+                                logger.info(f"River Learning (Corrected): Called learn for ID {self.last_response_id} with input '{user_input[:50]}...' and CORRECTED label '{correct_label}'")
+                            except Exception as learn_e:
+                                logger.error(f"River Learning (Corrected): Error calling learn for ID {self.last_response_id}: {learn_e}")
+                        else:
+                            logger.info(f"River Learning (Corrected): User cancelled feedback dialog for ID {self.last_response_id}.")
+                    else:
+                        logger.warning(f"River Learning (Corrected): Skipping feedback for ID {self.last_response_id} due to missing input context.")
+                 else:
+                     logger.warning(f"River Learning (Corrected): Skipping feedback for ID {self.last_response_id} - context not found.")
+            # --- End Negative Feedback Handling ---
+                 
+            # Original Feedback Processing for LLMManager (if needed)
+            if self.llm_manager.process_feedback(is_positive, self.last_response_id):
+                # Feedback erfolgreich verarbeitet
+                feedback_type = "positiv" if is_positive else "negativ"
+                logger.info(f"Feedback ({feedback_type}) für Antwort-ID {self.last_response_id} erfolgreich verarbeitet")
+                
+                # Deaktiviere die Feedback-Buttons
+                self.thumbs_up_button.setEnabled(False)
+                self.thumbs_down_button.setEnabled(False)
+                
+                # Zeige Bestätigung im Chat
+                self.on_update_chat("System", f"Danke für dein {feedback_type}es Feedback!")
+            else:
+                logger.error(f"Fehler beim Verarbeiten des Feedbacks für Antwort-ID {self.last_response_id}")
+                self.on_update_chat("System", "Entschuldigung, das Feedback konnte nicht verarbeitet werden.")
+                
+        except Exception as e:
+            error_msg = f"Fehler beim Senden des Feedbacks: {str(e)}"
+            logger.error(error_msg)
+            self.on_update_chat("System", error_msg)
+
+class KnowledgeImportThread(QThread):
+    """Importiert Wissensdateien im Hintergrund."""
+    # Signale:
+    # update_status(message)
+    update_status = pyqtSignal(str)
+    # import_finished(success_count, total_count)
+    import_finished = pyqtSignal(int, int)
+
+    def __init__(self, file_paths: List[str], learning_manager: LearningManager, import_dir: str = "data/knowledge_import", parent=None):
+        super().__init__(parent)
+        self.file_paths = file_paths
+        self.learning_manager = learning_manager
+        self.import_dir = import_dir
+        self.log_prefix = "[KnowledgeImportThread]"
+
+    def run(self):
+        """Führt den Importprozess für die übergebenen Dateien aus."""
+        success_count = 0
+        total_count = len(self.file_paths)
+        logger.info(f"{self.log_prefix} Starte Import von {total_count} Dateien...")
+        self.update_status.emit(f"Starte Import von {total_count} Dateien...")
+
+        try:
+            # Stelle sicher, dass das Zielverzeichnis existiert
+            os.makedirs(self.import_dir, exist_ok=True)
+
+            for i, source_path in enumerate(self.file_paths):
+                filename = os.path.basename(source_path)
+                target_path = os.path.join(self.import_dir, filename)
+                
+                current_status = f"Importiere Datei {i+1}/{total_count}: {filename}..."
+                logger.info(f"{self.log_prefix} {current_status}")
+                self.update_status.emit(current_status)
+
+                try:
+                    # 1. Datei ins Import-Verzeichnis kopieren (optional, aber empfohlen)
+                    # Prüfe, ob die Datei (mit gleichem Inhalt) schon existiert? Vorerst einfache Namensprüfung.
+                    if os.path.exists(target_path):
+                         # Optional: Überspringen oder Überschreiben oder Versionieren?
+                         # Fürs Erste: Überspringen, wenn der Name gleich ist.
+                         logger.info(f"{self.log_prefix} Datei '{filename}' existiert bereits im Import-Ordner. Überspringe Kopieren.")
+                         # Wir versuchen trotzdem, sie zu lernen, falls sie noch nicht in der KB ist
+                    else:
+                        shutil.copy2(source_path, target_path) # copy2 behält Metadaten bei
+                        logger.info(f"{self.log_prefix} Datei nach '{target_path}' kopiert.")
+
+                    # 2. Datei mit LearningManager lernen (verwendet jetzt den Pfad im Import-Ordner)
+                    # Optional: Prüfen, ob das *Dokument* (nicht nur die Datei) schon gelernt wurde?
+                    # is_already_learned = any(
+                    #     item.get('entry_type') == 'document' and item.get('source') == filename 
+                    #     for item in self.learning_manager.knowledge_base # <-- Ineffizient! Lädt alles.
+                    # )
+                    
+                    # Effizientere Dublettenprüfung direkt über ChromaDB
+                    try:
+                        existing_doc = self.learning_manager.collection.get(
+                            # Korrigierte where-Klausel mit $and Operator (ohne Backslash-Escaping)
+                            where={"$and": [{"entry_type": "document"}, {"source": filename}]},
+                            limit=1,
+                            include=[] # Wir brauchen nur die Info, OB es existiert
+                        )
+                        is_already_learned = len(existing_doc['ids']) > 0
+                    except Exception as db_check_error:
+                        logger.error(f"{self.log_prefix} Fehler bei der Dublettenprüfung für {filename}: {db_check_error}")
+                        is_already_learned = False # Im Zweifel lieber versuchen zu lernen
+
+                    if is_already_learned:
+                        logger.info(f"{self.log_prefix} Dokument '{filename}' wurde bereits gelernt. Überspringe lernen.")
+                        # Zählen wir übersprungene als "Erfolg"? Ja, da das Wissen da ist.
+                        success_count += 1
+                        continue # Nächste Datei
+                        
+                    learn_success = self.learning_manager.learn_from_file(target_path)
+                    if learn_success:
+                        success_count += 1
+                    else:
+                         logger.info(f"{self.log_prefix} Fehler beim Lernen von Datei: {filename}")
+                         # Optional: Kopierte Datei wieder löschen?
+
+                except Exception as copy_learn_error:
+                    logger.error(f"{self.log_prefix} Fehler bei Verarbeitung von {filename}: {copy_learn_error}")
+                    self.update_status.emit(f"Fehler bei {filename}: {copy_learn_error}")
+                    # Nicht abbrechen, nächste Datei versuchen
+
+            # 3. Vektoren aktualisieren nach dem Verarbeiten aller Dateien
+            if success_count > 0: # Nur aktualisieren, wenn etwas Neues hinzugefügt wurde
+                logger.info(f"{self.log_prefix} Aktualisiere Vektoren nach Import...")
+                self.update_status.emit("Aktualisiere Wissens-Vektoren...")
+                self.learning_manager.update_vectors()
+                logger.info(f"{self.log_prefix} Vektoren aktualisiert.")
+                
+                # 4. Wissensbasis speichern
+                logger.info(f"{self.log_prefix} Speichere aktualisierte Wissensbasis...")
+                self.update_status.emit("Speichere Wissensbasis...")
+                self.learning_manager.save_knowledge_base()
+                logger.info(f"{self.log_prefix} Wissensbasis gespeichert.")
+
+        except Exception as e:
+            logger.error(f"{self.log_prefix} Schwerwiegender Fehler während des Imports: {e}")
+            traceback.print_exc()
+            self.update_status.emit(f"Importfehler: {e}")
+        finally:
+            # Sende finales Signal
+            final_message = f"Import beendet: {success_count} von {total_count} Dateien verarbeitet."
+            logger.info(f"{self.log_prefix} {final_message}")
+            self.update_status.emit(final_message)
+            self.import_finished.emit(success_count, total_count)
+
+class TextProcessingThread(QThread):
+    """Thread für die Verarbeitung von Texteingaben."""
+    update_chat = pyqtSignal(str, str, str) # sender, message, response_id
+    trigger_tts = pyqtSignal(str)
+    processing_finished = pyqtSignal(bool, str)
+
+    # Add river_learning_manager and response_id to constructor
+    def __init__(self, text: str, llm_manager, config, learning_manager, river_learning_manager, response_id: str, parent=None):
+        super().__init__(parent)
+        self.text = text
+        self.llm_manager = llm_manager
+        self.config = config
+        self.learning_manager = learning_manager
+        self.river_learning_manager = river_learning_manager # Store instance
+        self.response_id = response_id # Store response_id
+        self.log_prefix = "[TextProcessingThread]"
+
+    def run(self):
+        """Verarbeitet die Texteingabe und erhält eine Antwort vom LLM."""
+        try:
+            logger.info(f"{self.log_prefix} Verarbeite Text: '{self.text}'")
+            
+            # --- Schritt 0.5: Predict intent with River --- 
+            if self.river_learning_manager:
+                try:
+                    intent_prediction = self.river_learning_manager.predict(self.text)
+                    logger.info(f"{self.log_prefix} River Intent Prediction: '{intent_prediction}' for '{self.text}'")
+                    # Store prediction in context
+                    if hasattr(self.parent(), 'interaction_context') and self.response_id in self.parent().interaction_context:
+                         self.parent().interaction_context[self.response_id]["river_prediction"] = intent_prediction
+                    # TODO: Use the prediction later (e.g., adapt prompt?)
+                except Exception as river_e:
+                    logger.warning(f"{self.log_prefix} River prediction failed: {river_e}")
+            else:
+                logger.warning(f"{self.log_prefix} RiverLearningManager not available for prediction.")
+            
+            # --- Schritt 1: Sende Text direkt an LLM --- 
+            if not self.llm_manager:
+                raise RuntimeError("LLM Manager ist nicht initialisiert")
+                
+            logger.info(f"{self.log_prefix} Rufe llm_manager.process_text auf...")
+            llm_response = self.llm_manager.process_text(self.text)
+            
+            if not llm_response:
+                raise RuntimeError("LLM hat keine Antwort zurückgegeben")
+                
+            logger.info(f"{self.log_prefix} LLM Antwort erhalten: '{llm_response[:100]}...'")
+            
+            # Speichere die Konversation in der Wissensbasis
+            if self.learning_manager:
+                try:
+                    # Erstelle Metadaten für die Konversation
+                    metadata = {
+                        "entry_type": "conversation",
+                        "timestamp": datetime.now().isoformat(),
+                        "input": self.text,
+                        "response": llm_response
+                    }
+                    
+                    # Füge die Konversation zur Wissensbasis hinzu
+                    self.learning_manager.add_entry(
+                        doc_id=str(uuid.uuid4()),
+                        content=f"Frage: {self.text}\nAntwort: {llm_response}",
+                        metadata=metadata
+                    )
+                    
+                    logger.info(f"{self.log_prefix} Konversation in Wissensbasis gespeichert")
+                except Exception as e:
+                    logger.error(f"{self.log_prefix} Fehler beim Speichern der Konversation: {str(e)}")
+            
+            # Sende LLM Antwort an GUI mit response_id
+            self.update_chat.emit("JARVIS", llm_response, self.response_id)
+            
+            # Trigger TTS wenn aktiviert
+            try:
+                if self.config and self.config.get('tts', 'enable_tts', fallback=False):
+                    self.trigger_tts.emit(llm_response)
+                    logger.debug(f"{self.log_prefix} TTS Signal gesendet für Antwort.")
+                else:
+                    logger.debug(f"{self.log_prefix} TTS ist in der Konfiguration deaktiviert oder Config-Objekt fehlt.")
+            except Exception as e:
+                logger.error(f"{self.log_prefix} Fehler beim Prüfen der TTS-Konfiguration oder beim Senden des Signals: {e}", exc_info=True)
+
+            self.processing_finished.emit(True, llm_response)
+            
+        except Exception as e:
+            error_msg = f"{self.log_prefix} Fehler in der Verarbeitung: {str(e)}"
+            logger.error(error_msg)
+            logger.error(traceback.format_exc())
+            self.update_chat.emit("System", error_msg)
+            self.processing_finished.emit(False, str(e))
+
+class MainWindow(QMainWindow):
+    def __init__(self, config_manager, llm_manager, learning_manager, river_learning_manager, task_manager):
+        super().__init__()
+        logger.info("Initialisiere MainWindow...")
+        
+        # Setze Fenstergröße und Titel
+        self.setWindowTitle("JARVIS - Intelligenter Assistent")
+        self.setMinimumSize(1600, 900)  # Erhöhte Mindestgröße
+        self.resize(1600, 900)  # Standardgröße beim Start
+        self.setWindowState(Qt.WindowState.WindowMaximized)  # Starte maximiert
+        
+        # Speichere die Manager
+        self.config_manager = config_manager
+        self.config = config_manager.config  # Speichere die Konfiguration
+        self.llm_manager = llm_manager
+        self.learning_manager = learning_manager
+        self.river_learning_manager = river_learning_manager
+        self.task_manager = task_manager
+        
+        # Initialisiere AudioProcessor
+        self.audio_processor = AudioProcessor()
+        logger.info("AudioProcessor initialisiert")
+        
+        # Initialisiere Whisper Recognizer auf None
+        self.whisper_recognizer = None
+        
+        # Initialisiere TTS-Manager mit der Factory-Funktion
+        self.tts_manager: Optional[BaseTTSManager] = None # Type Hinting mit Basisklasse
+        try:
+            # Erstelle TTS Manager über die Factory
+            self.tts_manager = create_tts_manager(self.config)
+            if self.tts_manager and self.tts_manager.check_readiness():
+                 logger.info("TTS-Manager erfolgreich initialisiert und bereit.")
+            elif self.tts_manager:
+                 logger.warning("TTS-Manager initialisiert, aber nicht bereit.")
+            else:
+                 logger.error("TTS-Manager konnte nicht erstellt werden (siehe vorherige Logs).")
+
+        except Exception as e:
+            logger.error(f"Schwerwiegender Fehler bei der TTS-Initialisierung via Factory: {e}", exc_info=True)
+            self.tts_manager = None # Sicherstellen, dass es None ist im Fehlerfall
+        
+        # Initialisiere Grundzustand
+        self.is_recording = False
+        self.audio_thread = None
+        self.processing_thread = None
+        self.last_response_id = None  # Speichert die ID der letzten Antwort
+        self.interaction_context = {} # Store user input and river prediction per interaction
+        
+        # Initialisiere main_layout als None
+        self.main_layout = None
+        
+        # Initialisiere Audio-Visualizer
+        self.audio_visualizer = AudioVisualizer()
+        self.audio_visualizer.setMinimumHeight(50)
+        self.audio_visualizer.setMaximumHeight(100)
+        
+        # UI initialisieren
+        self.init_ui()
+        logger.debug("UI erfolgreich initialisiert")
+        
+        # Whisper initialisieren
+        self.init_whisper()
+        logger.debug("Whisper initialisiert")
+        
+        # LLaMA initialisieren
+        self.init_llama()
+        logger.debug("LLaMA initialisiert")
+        
+        # Gespeichertes Mikrofon laden
+        self.load_saved_microphone()
+        logger.debug("Mikrofon-Konfiguration geladen")
+        
+        # Timer und initiale Updates NACH init_ui
+        self.status_timer = QTimer(self)
+        self.status_timer.timeout.connect(self.update_status)
+        self.status_timer.start(2000)  # Update alle 2 Sekunden
+        logger.debug("Status-Timer initialisiert")
+        
+        self.db_size_timer = QTimer(self)
+        self.db_size_timer.timeout.connect(self.update_db_size_display)
+        self.db_size_timer.start(10000) # Update alle 10 Sekunden
+        logger.debug("DB-Größen-Timer initialisiert")
+
+        # Wetter-Timer initialisieren
+        self.weather_timer = QTimer(self)
+        self.weather_timer.timeout.connect(self.update_weather)
+        self.weather_timer.start(300000)  # Update alle 5 Minuten (300000 ms)
+        logger.debug("Wetter-Timer initialisiert")
+        
+        self.update_status() # Initiales Update für CPU/RAM/GPU
+        self.update_db_size_display() # Initiales Update für DB Größe
+        self.update_weather() # Initiales Update für Wetter
+        
+        # Lade und zeige initiale Aufgabenliste
+        self.load_and_display_tasks() 
+        
+        # Beispiel für eine anfängliche Nachricht
+        self.on_update_chat("JARVIS", "Guten Tag! Wie kann ich Ihnen behilflich sein?")
+        logger.info("MainWindow Initialisierung abgeschlossen")
+
+    def init_ui(self):
+        """Initialisiert die Benutzeroberfläche."""
+        try:
+            logger.info("UI wird initialisiert...")
+            
+            # Hauptfenster-Layout
+            central_widget = QWidget()
+            self.setCentralWidget(central_widget)
+            
+            # Hauptlayout
+            main_layout = QVBoxLayout(central_widget)  # Vertikales Hauptlayout
+            
+            # Horizontales Layout für die drei Spalten
+            content_layout = QHBoxLayout()
+            
+            # Linke Spalte - Aufgabenverwaltung
+            left_column = QVBoxLayout()
+            task_group = QGroupBox("Aufgabenverwaltung")
+            task_layout = QVBoxLayout(task_group)
+            
+            # Aufgabenliste
+            self.task_list_widget = QListWidget()
+            self.task_list_widget.setAlternatingRowColors(True)
+            task_layout.addWidget(self.task_list_widget)
+            
+            # Eingabefeld und Buttons für Aufgaben
+            task_input_layout = QHBoxLayout()
+            self.task_input_field = QLineEdit()
+            self.task_input_field.setPlaceholderText("Neue Aufgabe eingeben...")
+            self.task_input_field.returnPressed.connect(self.add_new_task)
+            task_input_layout.addWidget(self.task_input_field)
+            
+            self.task_add_button = QPushButton("Hinzufügen")
+            self.task_add_button.clicked.connect(self.add_new_task)
+            task_input_layout.addWidget(self.task_add_button)
+            
+            task_layout.addLayout(task_input_layout)
+            
+            # Buttons für Aufgabenverwaltung
+            task_button_layout = QHBoxLayout()
+            
+            self.task_complete_button = QPushButton("Als erledigt markieren")
+            self.task_complete_button.clicked.connect(self.complete_selected_task)
+            task_button_layout.addWidget(self.task_complete_button)
+            
+            self.task_remove_button = QPushButton("Entfernen")
+            self.task_remove_button.clicked.connect(self.remove_selected_task)
+            task_button_layout.addWidget(self.task_remove_button)
+            
+            task_layout.addLayout(task_button_layout)
+            left_column.addWidget(task_group)
+            
+            # Mittlere Spalte - Chat und Audio
+            middle_column = QVBoxLayout()
+            
+            # Status-Bereich
+            status_group = QGroupBox("Status")
+            status_layout = QVBoxLayout(status_group)
+            
+            # Whisper & LLM Status
+            whisper_status = QLabel("Whisper: Bereit")
+            whisper_status.setStyleSheet("color: #00ff00;")  # Grün für "Bereit"
+            status_layout.addWidget(whisper_status)
+            
+            # LLM Status Layout
+            llm_status_layout = QHBoxLayout()
+            llm_label = QLabel("LLM:")
+            llm_combo = QComboBox()
+            llm_combo.addItem("Ollama")
+            model_combo = QComboBox()
+            model_combo.addItem("llama3.8b")
+            prompt_edit_btn = QPushButton("Prompt bearbeiten")
+            
+            llm_status_layout.addWidget(llm_label)
+            llm_status_layout.addWidget(llm_combo)
+            llm_status_layout.addWidget(QLabel("Modell:"))
+            llm_status_layout.addWidget(model_combo)
+            llm_status_layout.addWidget(prompt_edit_btn)
+            status_layout.addLayout(llm_status_layout)
+            
+            # Steuerung Layout
+            control_layout = QHBoxLayout()
+            mic_label = QLabel("Mikrofon:")
+            self.mic_status = QLabel("Mikrofon (Moman EMP Microphone)")
+            self.mic_status.setStyleSheet("color: #00ff00;")  # Grün für aktives Mikrofon
+            mic_select_btn = QPushButton("Mikrofon auswählen")
+            self.record_btn = QPushButton("Aufnahme starten")
+            
+            control_layout.addWidget(mic_label)
+            control_layout.addWidget(self.mic_status)
+            control_layout.addWidget(mic_select_btn)
+            control_layout.addWidget(self.record_btn)
+            status_layout.addLayout(control_layout)
+            
+            middle_column.addWidget(status_group)
+            
+            # Wissensbasis Lernen
+            knowledge_group = QGroupBox("Wissensbasis Lernen")
+            knowledge_layout = QVBoxLayout(knowledge_group)
+            
+            # Import Buttons
+            file_import_btn = QPushButton("📄 Dateien importieren")
+            audiobook_import_btn = QPushButton("🔊 Audiobücher lernen (Ordner)")
+            
+            knowledge_layout.addWidget(file_import_btn)
+            knowledge_layout.addWidget(audiobook_import_btn)
+            
+            # Datenbank Status
+            db_status = QLabel("Datenbank: 22002.51 KB | 1886 Einträge | conversation: 9 | response: 131 | audio_transcript_chunk: 35 | audiobook_chunk: 1089 | document_chunk: 622")
+            db_status.setWordWrap(True)
+            knowledge_layout.addWidget(db_status)
+            
+            middle_column.addWidget(knowledge_group)
+            
+            # Chat-Bereich
+            chat_group = QGroupBox("Chat")
+            chat_layout = QVBoxLayout(chat_group)
+            self.chat_area = QTextEdit()
+            self.chat_area.setReadOnly(True)
+            chat_layout.addWidget(self.chat_area)
+            
+            # Feedback und Eingabe Layout
+            feedback_input_layout = QVBoxLayout()
+            
+            # Feedback Buttons
+            feedback_layout = QHBoxLayout()
+            feedback_label = QLabel("War diese Antwort hilfreich?")
+            thumbs_up_btn = QPushButton("👍")
+            thumbs_down_btn = QPushButton("👎")
+            feedback_layout.addWidget(feedback_label)
+            feedback_layout.addWidget(thumbs_up_btn)
+            feedback_layout.addWidget(thumbs_down_btn)
+            feedback_layout.addStretch()
+            feedback_input_layout.addLayout(feedback_layout)
+            
+            # Texteingabe und Senden-Button
+            input_layout = QHBoxLayout()
+            self.text_input = QLineEdit()
+            self.text_input.setPlaceholderText("Nachricht eingeben...")
+            self.text_input.setMinimumHeight(75)  # 3 Zeilen Höhe
+            self.text_input.returnPressed.connect(self.send_text_message)
+            
+            send_btn = QPushButton("Senden")
+            send_btn.setMinimumHeight(75)  # 3 Zeilen Höhe
+            send_btn.setFixedWidth(100)    # Feste Breite für rechteckige Form
+            send_btn.clicked.connect(self.send_text_message)
+            
+            input_layout.addWidget(self.text_input)
+            input_layout.addWidget(send_btn)
+            feedback_input_layout.addLayout(input_layout)
+            
+            chat_layout.addLayout(feedback_input_layout)
+            middle_column.addWidget(chat_group)
+            
+            # Rechte Spalte - Wetter und Internet
+            right_column = QVBoxLayout()
+            
+            # Wetter-Gruppe
+            weather_group = QGroupBox("Wetter")
+            weather_layout = QVBoxLayout(weather_group)
+            weather_layout.setSpacing(1)  # Noch kleinerer Abstand zwischen den Widgets
+            weather_layout.setContentsMargins(5, 5, 5, 5)  # Noch kleinere Ränder
+            
+            # Setze maximale Höhe für die Wetter-Gruppe
+            weather_group.setMaximumHeight(200)  # Begrenzt die maximale Höhe
+            
+            # Wetter-Informationen in einem kompakteren Layout
+            weather_info_widget = QWidget()
+            weather_info_layout = QVBoxLayout(weather_info_widget)
+            weather_info_layout.setSpacing(1)  # Minimaler Abstand zwischen den Labels
+            weather_info_layout.setContentsMargins(0, 0, 0, 0)  # Keine Ränder
+            
+            # Erstelle Labels mit reduzierter Höhe
+            self.time_label = QLabel("⌚ Zeit: --:--")
+            self.location_label = QLabel("📍 Dresden")
+            self.temp_label = QLabel("🌡️ Temperatur: --°C")
+            self.feel_label = QLabel("🌡️ Gefühlt: --°C")
+            self.clouds_label = QLabel("☁️ --")
+            self.humidity_label = QLabel("💧 Luftfeuchtigkeit: --%")
+            self.wind_label = QLabel("💨 Wind: -- km/h")
+            self.update_label = QLabel("Letzte Aktualisierung: --:--")
+            
+            # Setze eine feste Höhe für jedes Label
+            for label in [self.time_label, self.location_label, self.temp_label, 
+                         self.feel_label, self.clouds_label, self.humidity_label, 
+                         self.wind_label, self.update_label]:
+                label.setFixedHeight(20)  # Feste Höhe für jedes Label
+                weather_info_layout.addWidget(label)
+            
+            # Füge das Wetter-Info-Widget zum Wetter-Layout hinzu
+            weather_layout.addWidget(weather_info_widget)
+            weather_layout.addStretch(1)  # Fügt flexiblen Platz am Ende hinzu
+            
+            right_column.addWidget(weather_group)
+            
+            # Internet-Gruppe
+            internet_group = QGroupBox("Internet")
+            internet_layout = QVBoxLayout(internet_group)
+            
+            # Online-Status
+            online_status = QLabel("🟢 Online-Modus")
+            internet_layout.addWidget(online_status)
+            
+            # URL-Eingabe
+            url_layout = QHBoxLayout()
+            url_input = QLineEdit()
+            url_input.setPlaceholderText("URL eingeben...")
+            search_btn = QPushButton("Suchen")
+            url_layout.addWidget(url_input)
+            url_layout.addWidget(search_btn)
+            internet_layout.addLayout(url_layout)
+            
+            # Optionen
+            options_layout = QVBoxLayout()
+            links_check = QCheckBox("Links extrahieren")
+            images_check = QCheckBox("Bilder erfassen")
+            titles_check = QCheckBox("Überschriften analysieren")
+            auto_save_check = QCheckBox("Automatisch speichern")
+            
+            options_layout.addWidget(links_check)
+            options_layout.addWidget(images_check)
+            options_layout.addWidget(titles_check)
+            options_layout.addWidget(auto_save_check)
+            
+            internet_layout.addLayout(options_layout)
+            
+            # Bereit & Ergebnis Labels
+            bereit_label = QLabel("Bereit")
+            ergebnis_label = QLabel("Ergebnis")
+            internet_layout.addWidget(bereit_label)
+            internet_layout.addWidget(ergebnis_label)
+            
+            # Speichern & Löschen Buttons
+            button_layout = QHBoxLayout()
+            save_btn = QPushButton("Speichern")
+            delete_btn = QPushButton("Löschen")
+            button_layout.addWidget(save_btn)
+            button_layout.addWidget(delete_btn)
+            internet_layout.addLayout(button_layout)
+            
+            right_column.addWidget(internet_group)
+            
+            # Füge die Spalten zum content_layout hinzu
+            content_layout.addLayout(left_column, 1)      # 1/4 der Breite
+            content_layout.addLayout(middle_column, 2)    # 2/4 der Breite
+            content_layout.addLayout(right_column, 1)     # 1/4 der Breite
+            
+            # Füge content_layout zum main_layout hinzu
+            main_layout.addLayout(content_layout)
+            
+            # Statusleiste am unteren Rand
+            status_bar = QStatusBar()
+            self.setStatusBar(status_bar)
+            
+            # CPU, RAM, GPU Status Labels erstellen
+            status_widget = QWidget()
+            status_layout = QHBoxLayout(status_widget)
+            
+            self.cpu_label = QLabel("CPU: --%")
+            self.ram_label = QLabel("RAM: --%")
+            self.gpu_label = QLabel("GPU: --%")
+            self.model_label = QLabel("Modell: --")
+            self.db_label = QLabel("DB: -- MB")
+            
+            status_layout.addWidget(self.cpu_label)
+            status_layout.addWidget(QLabel("|"))
+            status_layout.addWidget(self.ram_label)
+            status_layout.addWidget(QLabel("|"))
+            status_layout.addWidget(self.gpu_label)
+            status_layout.addWidget(QLabel("|"))
+            status_layout.addWidget(self.model_label)
+            status_layout.addWidget(QLabel("|"))
+            status_layout.addWidget(self.db_label)
+            
+            status_bar.addPermanentWidget(status_widget)
+            
+            # Signal-Verbindungen
+            mic_select_btn.clicked.connect(self.show_mic_selector)
+            self.record_btn.clicked.connect(self.toggle_recording)
+            file_import_btn.clicked.connect(self.import_files)
+            audiobook_import_btn.clicked.connect(self.import_audiobook)
+            thumbs_up_btn.clicked.connect(lambda: self.send_feedback(True))
+            thumbs_down_btn.clicked.connect(lambda: self.send_feedback(False))
+            prompt_edit_btn.clicked.connect(self.show_prompt_editor)
+            
+            # Speichere wichtige UI-Elemente als Instanzvariablen
+            self.whisper_status = whisper_status
+            self.llm_combo = llm_combo
+            self.model_combo = model_combo
+            self.mic_status = self.mic_status
+            self.record_btn = self.record_btn
+            self.db_status = db_status
+            self.thumbs_up_btn = thumbs_up_btn
+            self.thumbs_down_btn = thumbs_down_btn
+            
+            # Deaktiviere Feedback-Buttons initial
+            self.thumbs_up_btn.setEnabled(False)
+            self.thumbs_down_btn.setEnabled(False)
+            
+        except Exception as e:
+            logger.error(f"Fehler beim Initialisieren der UI: {e}", exc_info=True)
+            raise
+
+    def init_whisper(self):
+        """Initialisiert den Whisper Recognizer."""
+        try:
+            logger.info("Initialisiere Whisper Recognizer...")
+            # Starte den Ladevorgang im Hintergrund
+            self.model_loader = ModelLoaderThread(self)
+            self.model_loader.finished.connect(self.on_whisper_loaded)
+            self.model_loader.error.connect(self.on_whisper_error)
+            self.model_loader.start()
+            
+            # Aktualisiere UI-Status
+            self.whisper_status.setText("Whisper: Wird geladen...")
+            self.whisper_status.setStyleSheet("color: #ffaa00;")  # Orange für "Wird geladen"
+            
+        except Exception as e:
+            logger.error(f"Fehler bei der Whisper-Initialisierung: {e}")
+            self.whisper_status.setText("Whisper: Fehler")
+            self.whisper_status.setStyleSheet("color: #ff0000;")  # Rot für Fehler
+            
+    def on_whisper_loaded(self, recognizer):
+        """Wird aufgerufen, wenn Whisper erfolgreich geladen wurde."""
+        try:
+            self.whisper_recognizer = recognizer
+            self.whisper_status.setText("Whisper: Bereit")
+            self.whisper_status.setStyleSheet("color: #00ff00;")  # Grün für "Bereit"
+            logger.info("Whisper Recognizer erfolgreich initialisiert")
+        except Exception as e:
+            logger.error(f"Fehler beim Setzen des Whisper Recognizers: {e}")
+            
+    def on_whisper_error(self, error_msg: str):
+        """Wird aufgerufen, wenn beim Laden von Whisper ein Fehler auftritt."""
+        self.whisper_status.setText("Whisper: Fehler")
+        self.whisper_status.setStyleSheet("color: #ff0000;")  # Rot für Fehler
+        logger.error(f"Fehler beim Laden von Whisper: {error_msg}")
+
+    def init_llama(self):
+        # Implementiere die Initialisierung von LLaMA
+        pass
+
+    def load_saved_microphone(self):
+        """Lädt die gespeicherte Mikrofonkonfiguration."""
+        try:
+            # Versuche gespeicherten Mikrofonindex aus der Konfiguration zu laden
+            saved_index = self.config.get('audio', 'microphone_index', fallback=None)
+            
+            if saved_index is not None:
+                try:
+                    saved_index = int(saved_index)
+                    # Prüfe ob das gespeicherte Mikrofon noch verfügbar ist
+                    p = pyaudio.PyAudio()
+                    try:
+                        device_info = p.get_device_info_by_index(saved_index)
+                        if device_info.get('maxInputChannels') > 0:
+                            self.selected_mic_index = saved_index
+                            self.mic_status.setText(f"Mikrofon ({device_info['name']})")
+                            self.mic_status.setStyleSheet("color: #00ff00;")  # Grün für aktives Mikrofon
+                            logger.info(f"Gespeichertes Mikrofon geladen: {device_info['name']}")
+                            return
+                    except Exception as e:
+                        logger.warning(f"Gespeichertes Mikrofon (Index {saved_index}) nicht mehr verfügbar: {e}")
+                    finally:
+                        p.terminate()
+                except ValueError:
+                    logger.warning(f"Ungültiger Mikrofonindex in Konfiguration: {saved_index}")
+            
+            # Wenn kein Mikrofon gespeichert oder nicht mehr verfügbar,
+            # versuche das Standardmikrofon zu finden
+            self.select_default_microphone()
+            
+        except Exception as e:
+            logger.error(f"Fehler beim Laden der Mikrofonkonfiguration: {e}")
+            self.mic_status.setText("Kein Mikrofon ausgewählt")
+            self.mic_status.setStyleSheet("color: #ff0000;")  # Rot für Fehler
+            
+    def select_default_microphone(self):
+        """Wählt das Standardmikrofon aus."""
+        try:
+            p = pyaudio.PyAudio()
+            try:
+                # Suche nach dem Standardeingabegerät
+                default_index = p.get_default_input_device_info()['index']
+                device_info = p.get_device_info_by_index(default_index)
+                
+                if device_info.get('maxInputChannels') > 0:
+                    self.selected_mic_index = default_index
+                    self.mic_status.setText(f"Mikrofon ({device_info['name']})")
+                    self.mic_status.setStyleSheet("color: #00ff00;")  # Grün für aktives Mikrofon
+                    logger.info(f"Standardmikrofon ausgewählt: {device_info['name']}")
+                    
+                    # Speichere die Auswahl in der Konfiguration
+                    self.config.set('audio', 'microphone_index', str(default_index))
+                    return
+                    
+            except Exception as e:
+                logger.warning(f"Konnte Standardmikrofon nicht finden: {e}")
+                
+            # Wenn Standardmikrofon nicht verfügbar, suche nach dem ersten verfügbaren Mikrofon
+            for i in range(p.get_device_count()):
+                try:
+                    device_info = p.get_device_info_by_index(i)
+                    if device_info.get('maxInputChannels') > 0:
+                        self.selected_mic_index = i
+                        self.mic_status.setText(f"Mikrofon ({device_info['name']})")
+                        self.mic_status.setStyleSheet("color: #00ff00;")  # Grün für aktives Mikrofon
+                        logger.info(f"Erstes verfügbares Mikrofon ausgewählt: {device_info['name']}")
+                        
+                        # Speichere die Auswahl in der Konfiguration
+                        self.config.set('audio', 'microphone_index', str(i))
+                        return
+                except:
+                    continue
+                    
+            # Wenn kein Mikrofon gefunden wurde
+            raise Exception("Kein funktionierendes Mikrofon gefunden")
+            
+        except Exception as e:
+            logger.error(f"Fehler bei der Mikrofonauswahl: {e}")
+            self.mic_status.setText("Kein Mikrofon verfügbar")
+            self.mic_status.setStyleSheet("color: #ff0000;")  # Rot für Fehler
+            self.selected_mic_index = None
+        finally:
+            if 'p' in locals():
+                p.terminate()
+                
+    def show_mic_selector(self):
+        """Zeigt den Dialog zur Mikrofonauswahl."""
+        try:
+            selector = MicrophoneSelector(self)
+            if selector.exec() == QDialog.DialogCode.Accepted:
+                selected_mic = selector.get_selected_microphone()
+                if selected_mic is not None:
+                    # Speichere den ausgewählten Mikrofon-Index
+                    self.selected_mic_index = selected_mic
+                    
+                    # Hole Geräteinformationen
+                    p = pyaudio.PyAudio()
+                    try:
+                        device_info = p.get_device_info_by_index(selected_mic)
+                        # Aktualisiere Mikrofon-Status
+                        self.mic_status.setText(f"Mikrofon ({device_info['name']})")
+                        self.mic_status.setStyleSheet("color: #00ff00;")  # Grün für aktives Mikrofon
+                        logger.info(f"Neues Mikrofon ausgewählt: {device_info['name']}")
+                        
+                        # Speichere die Auswahl in der Konfiguration
+                        self.config.set('audio', 'microphone_index', str(selected_mic))
+                    finally:
+                        p.terminate()
+                        
+        except Exception as e:
+            logger.error(f"Fehler bei der Mikrofonauswahl: {e}")
+            QMessageBox.critical(self, "Fehler", f"Fehler bei der Mikrofonauswahl:\n{e}")
+            self.mic_status.setText("Fehler bei Mikrofonauswahl")
+            self.mic_status.setStyleSheet("color: #ff0000;")  # Rot für Fehler
+
+    def update_status(self):
+        """Aktualisiert die Systemstatus-Anzeige."""
+        try:
+            # CPU Auslastung
+            cpu_percent = psutil.cpu_percent()
+            self.cpu_label.setText(f"CPU: {cpu_percent}%")
+            
+            # RAM Auslastung
+            ram = psutil.virtual_memory()
+            self.ram_label.setText(f"RAM: {ram.percent}%")
+            
+            # Datenbank Größe
+            db_size = get_directory_size("data/knowledge_base/chroma_db") / 1024  # Konvertiere zu MB
+            self.db_label.setText(f"DB: {db_size:.1f} MB")
+            
+            # Aktives Modell - Sicherere Implementierung
+            if self.llm_manager and hasattr(self.llm_manager, 'current_provider'):
+                if hasattr(self.llm_manager.current_provider, 'model_name'):
+                    model_name = self.llm_manager.current_provider.model_name
+                else:
+                    model_name = "llama3:8b"  # Fallback zum bekannten Modellnamen
+                self.model_label.setText(f"Modell: {model_name}")
+            else:
+                self.model_label.setText("Modell: --")
+                
+        except Exception as e:
+            logger.error(f"Fehler beim Aktualisieren des Status: {e}")
+            # Setze Standardwerte im Fehlerfall
+            self.cpu_label.setText("CPU: --")
+            self.ram_label.setText("RAM: --")
+            self.model_label.setText("Modell: --")
+            self.db_label.setText("DB: --")
+
+    def update_db_size_display(self):
+        """Aktualisiert die Anzeige der Datenbank-Größe."""
+        try:
+            # Hole die aktuellen Werte
+            db_size = get_directory_size("data/knowledge_base/chroma_db") / 1024  # Konvertiere zu MB
+            
+            # Hole die Anzahl der Einträge direkt aus der Collection
+            if self.learning_manager and hasattr(self.learning_manager, 'collection'):
+                total_entries = len(self.learning_manager.collection.get(
+                    include=[],
+                    limit=10000000  # Hoher Wert um alle Einträge zu bekommen
+                )['ids'])
+                
+                # Zähle die verschiedenen Typen
+                conversation_count = len(self.learning_manager.collection.get(
+                    where={"entry_type": "conversation"},
+                    include=[]
+                )['ids'])
+                
+                response_count = len(self.learning_manager.collection.get(
+                    where={"entry_type": "response"},
+                    include=[]
+                )['ids'])
+                
+                audio_transcript_count = len(self.learning_manager.collection.get(
+                    where={"entry_type": "audio_transcript_chunk"},
+                    include=[]
+                )['ids'])
+                
+                audiobook_count = len(self.learning_manager.collection.get(
+                    where={"entry_type": "audiobook_chunk"},
+                    include=[]
+                )['ids'])
+                
+                document_count = len(self.learning_manager.collection.get(
+                    where={"entry_type": "document_chunk"},
+                    include=[]
+                )['ids'])
+                
+                # Aktualisiere beide Anzeigen mit dem gleichen Wert
+                status_text = f"Datenbank: {db_size:.2f} MB | {total_entries} Einträge | conversation: {conversation_count} | response: {response_count} | audio_transcript_chunk: {audio_transcript_count} | audiobook_chunk: {audiobook_count} | document_chunk: {document_count}"
+                self.db_status.setText(status_text)
+                self.db_label.setText(f"DB: {db_size:.2f} MB")
+            else:
+                self.db_status.setText("Datenbank nicht verfügbar")
+                self.db_label.setText("DB: --")
+            
+        except Exception as e:
+            logger.error(f"Fehler beim Aktualisieren der Datenbank-Größe: {e}")
+            self.db_status.setText("Fehler beim Laden der Datenbank-Statistiken")
+            self.db_label.setText("DB: Fehler")
+
+    def on_update_chat(self, sender: str, message: str, response_id: str = None):
+        # Implementiere die Aktualisierung des Chats
+        pass
+
+    def on_trigger_tts(self, text: str):
+        # Implementiere die Auslösung des TTS
+        pass
+
+    def on_processing_finished(self, success: bool, result: str):
+        # Implementiere die Beendigung der Verarbeitung
+        pass
+
+    def start_webscraping(self):
+        """Startet den Webscraping-Prozess für die eingegebene URL."""
+        try:
+            url = self.url_input.text().strip()
+            if not url:
+                QMessageBox.warning(self, "Fehler", "Bitte geben Sie eine URL ein.")
+                return
+                
+            # Hier würde der eigentliche Webscraping-Code stehen
+            # Für jetzt nur eine Platzhalter-Nachricht
+            self.scraping_results.append(f"Scraping gestartet für: {url}")
+            self.scraping_results.append("Diese Funktion ist noch in Entwicklung...")
+            
+        except Exception as e:
+            logger.error(f"Fehler beim Webscraping: {e}")
+            QMessageBox.critical(self, "Fehler", f"Ein Fehler ist beim Webscraping aufgetreten:\n{e}")
+
+    def update_weather(self):
+        """Aktualisiert die Wetterinformationen."""
+        try:
+            current_time = QDateTime.currentDateTime().toString("HH:mm")
+            self.time_label.setText(f"⌚ Zeit: {current_time}")
+            
+            # OpenWeatherMap API-Konfiguration
+            api_key = self.config.get('weather', 'api_key', fallback=None)
+            city = self.config.get('weather', 'city', fallback='Dresden')
+            
+            if not api_key:
+                logger.warning("Kein OpenWeatherMap API-Key konfiguriert")
+                self.temp_label.setText("🌡️ API-Key fehlt")
+                return
+                
+            # API-Anfrage
+            url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}&units=metric&lang=de"
+            response = requests.get(url)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Extrahiere Wetterdaten
+                temp = data['main']['temp']
+                feels_like = data['main']['feels_like']
+                humidity = data['main']['humidity']
+                wind_speed = data['wind']['speed'] * 3.6  # Konvertiere m/s zu km/h
+                clouds = data['weather'][0]['description']
+                
+                # Aktualisiere UI
+                self.temp_label.setText(f"🌡️ Temperatur: {temp:.1f}°C")
+                self.feel_label.setText(f"🌡️ Gefühlt: {feels_like:.1f}°C")
+                self.clouds_label.setText(f"☁️ {clouds.capitalize()}")
+                self.humidity_label.setText(f"💧 Luftfeuchtigkeit: {humidity}%")
+                self.wind_label.setText(f"💨 Wind: {wind_speed:.1f} km/h")
+                self.update_label.setText(f"Letzte Aktualisierung: {current_time}")
+                
+                logger.info(f"Wetterdaten erfolgreich aktualisiert für {city}")
+            else:
+                error_msg = f"API-Fehler: {response.status_code}"
+                logger.error(error_msg)
+                self.temp_label.setText("🌡️ API-Fehler")
+                
+        except requests.RequestException as e:
+            logger.error(f"Netzwerkfehler bei Wetterabfrage: {e}")
+            self.temp_label.setText("🌡️ Netzwerkfehler")
+        except Exception as e:
+            logger.error(f"Fehler beim Aktualisieren des Wetters: {e}")
+            self.temp_label.setText("🌡️ Fehler")
+            self.feel_label.setText("🌡️ Gefühlt: Fehler")
+            self.clouds_label.setText("☁️ Fehler")
+            self.humidity_label.setText("💧 Luftfeuchtigkeit: Fehler")
+            self.wind_label.setText("💨 Wind: Fehler")
+            self.update_label.setText("Letzte Aktualisierung: Fehler")
+
+    def load_and_display_tasks(self):
+        """Loads tasks from the manager and displays them in the list widget."""
+        self.task_list_widget.clear()
+        try:
+            tasks = self.task_manager.list_tasks(status_filter="open")
+            if not tasks:
+                item = QListWidgetItem("Keine offenen Aufgaben")
+                item.setForeground(QColor("#888"))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+                self.task_list_widget.addItem(item)
+            else:
+                for task in tasks:
+                    item = QListWidgetItem(task.get('description', 'N/A'))
+                    item.setData(Qt.ItemDataRole.UserRole, task.get('id'))
+                    self.task_list_widget.addItem(item)
+        except Exception as e:
+            logger.error(f"Fehler beim Laden und Anzeigen der Aufgaben: {e}")
+            self.task_list_widget.addItem("Fehler beim Laden der Aufgaben")
+            
+    def add_new_task(self):
+        """Adds a new task from the input field."""
+        description = self.task_input_field.text().strip()
+        if description:
+            try:
+                added_task = self.task_manager.add_task(description)
+                if added_task:
+                    self.task_input_field.clear()
+                    self.load_and_display_tasks()
+                else:
+                    QMessageBox.warning(self, "Fehler", "Aufgabe konnte nicht hinzugefügt werden.")
+            except Exception as e:
+                logger.error(f"Fehler beim Hinzufügen der Aufgabe '{description}': {e}")
+                QMessageBox.critical(self, "Fehler", f"Ein Fehler ist beim Hinzufügen aufgetreten:\n{e}")
+                
+    def get_selected_task_id(self) -> Optional[str]:
+        """Returns the ID of the currently selected task in the list, or None."""
+        selected_items = self.task_list_widget.selectedItems()
+        if selected_items:
+            item = selected_items[0]
+            task_id = item.data(Qt.ItemDataRole.UserRole)
+            return task_id
+        return None
+        
+    def complete_selected_task(self):
+        """Marks the selected task as done."""
+        task_id = self.get_selected_task_id()
+        if task_id:
+            try:
+                success = self.task_manager.mark_task_done(task_id)
+                if success:
+                    self.load_and_display_tasks()
+                else:
+                    QMessageBox.warning(self, "Fehler", "Ausgewählte Aufgabe konnte nicht als erledigt markiert werden.")
+            except Exception as e:
+                logger.error(f"Fehler beim Erledigen der Aufgabe ID {task_id}: {e}")
+                QMessageBox.critical(self, "Fehler", f"Ein Fehler ist beim Erledigen aufgetreten:\n{e}")
+        else:
+            QMessageBox.information(self, "Hinweis", "Bitte zuerst eine Aufgabe auswählen.")
+            
+    def remove_selected_task(self):
+        """Removes the selected task."""
+        task_id = self.get_selected_task_id()
+        if task_id:
+            reply = QMessageBox.question(self, 'Aufgabe entfernen?', 
+                                       f"Möchten Sie die ausgewählte Aufgabe wirklich entfernen?",
+                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
+                                       QMessageBox.StandardButton.No)
+
+            if reply == QMessageBox.StandardButton.Yes:
+                try:
+                    success = self.task_manager.remove_task(task_id)
+                    if success:
+                        self.load_and_display_tasks()
+                    else:
+                        QMessageBox.warning(self, "Fehler", "Ausgewählte Aufgabe konnte nicht entfernt werden.")
+                except Exception as e:
+                    logger.error(f"Fehler beim Entfernen der Aufgabe ID {task_id}: {e}")
+                    QMessageBox.critical(self, "Fehler", f"Ein Fehler ist beim Entfernen aufgetreten:\n{e}")
+        else:
+            QMessageBox.information(self, "Hinweis", "Bitte zuerst eine Aufgabe auswählen.")
+
+    def import_files(self):
+        """Öffnet einen Dialog zur Auswahl von Dateien für den Import."""
+        try:
+            file_paths, _ = QFileDialog.getOpenFileNames(
+                self,
+                "Dateien zum Importieren auswählen",
+                "",
+                "Alle Dateien (*);;Text Dateien (*.txt);;PDF Dateien (*.pdf);;Word Dateien (*.doc *.docx)"
+            )
+            
+            if file_paths:
+                self.on_update_chat("System", f"Starte Import von {len(file_paths)} Dateien...")
+                # Starte den Import-Thread
+                self.import_thread = KnowledgeImportThread(
+                    file_paths=file_paths,
+                    learning_manager=self.learning_manager,
+                    parent=self
+                )
+                self.import_thread.update_status.connect(lambda msg: self.on_update_chat("System", msg))
+                self.import_thread.import_finished.connect(self.on_import_finished)
+                self.import_thread.start()
+        except Exception as e:
+            error_msg = f"Fehler beim Datei-Import: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            self.on_update_chat("System", error_msg)
+
+    def show_prompt_editor(self):
+        """Öffnet den Prompt-Editor."""
+        try:
+            editor = PromptEditor(self.config, self)
+            editor.exec()
+        except Exception as e:
+            logger.error(f"Fehler beim Öffnen des Prompt-Editors: {e}")
+            QMessageBox.critical(self, "Fehler", f"Fehler beim Öffnen des Prompt-Editors:\n{e}")
+
+    def on_import_finished(self, success_count: int, total_count: int):
+        """Wird aufgerufen, wenn der Import abgeschlossen ist."""
+        try:
+            # Aktualisiere die Datenbank-Statistiken
+            db_size = get_directory_size("data/knowledge_base/chroma_db") / 1024  # Konvertiere zu MB
+            
+            if self.learning_manager and hasattr(self.learning_manager, 'collection'):
+                # Hole die Anzahl der Einträge direkt aus der Collection
+                total_entries = len(self.learning_manager.collection.get(
+                    include=[],
+                    limit=10000000  # Hoher Wert um alle Einträge zu bekommen
+                )['ids'])
+                
+                # Zähle die verschiedenen Typen
+                conversation_count = len(self.learning_manager.collection.get(
+                    where={"entry_type": "conversation"},
+                    include=[]
+                )['ids'])
+                
+                response_count = len(self.learning_manager.collection.get(
+                    where={"entry_type": "response"},
+                    include=[]
+                )['ids'])
+                
+                audio_transcript_count = len(self.learning_manager.collection.get(
+                    where={"entry_type": "audio_transcript_chunk"},
+                    include=[]
+                )['ids'])
+                
+                audiobook_count = len(self.learning_manager.collection.get(
+                    where={"entry_type": "audiobook_chunk"},
+                    include=[]
+                )['ids'])
+                
+                document_count = len(self.learning_manager.collection.get(
+                    where={"entry_type": "document_chunk"},
+                    include=[]
+                )['ids'])
+                
+                # Aktualisiere das Label
+                status_text = f"Datenbank: {db_size:.2f} MB | {total_entries} Einträge | conversation: {conversation_count} | response: {response_count} | audio_transcript_chunk: {audio_transcript_count} | audiobook_chunk: {audiobook_count} | document_chunk: {document_count}"
+                self.db_status.setText(status_text)
+                
+                # Zeige Erfolgsmeldung
+                QMessageBox.information(self, "Import abgeschlossen", 
+                                      f"Import abgeschlossen: {success_count} von {total_count} Dateien erfolgreich importiert.")
+            else:
+                self.db_status.setText("Datenbank nicht verfügbar")
+                QMessageBox.warning(self, "Import abgeschlossen", 
+                                  f"Import abgeschlossen, aber Datenbank nicht verfügbar.")
+                
+        except Exception as e:
+            logger.error(f"Fehler beim Aktualisieren der Import-Statistiken: {e}")
+            QMessageBox.critical(self, "Fehler", f"Fehler beim Aktualisieren der Statistiken:\n{e}")
+
+    def start_audio_recording(self):
+        """
+        Startet die Audioaufnahme mit dem ausgewählten Mikrofon.
+        Initialisiert den AudioProcessor und startet den Aufnahme-Thread.
+        """
+        try:
+            # Hole den ausgewählten Mikrofonindex
+            mic_index = self.get_selected_microphone_index()
+            if mic_index is None:
+                raise ValueError("Kein Mikrofon ausgewählt")
+
+            # Initialisiere den AudioProcessor
+            self.audio_processor = AudioProcessor(mic_index)
+            
+            # Starte die Aufnahme
+            self.audio_processor.start_recording()
+            self.audio_visualizer.start_recording()
+            
+            # Starte den Timer für die Aufnahmedauer
+            self.recording_timer.start(1000)  # Aktualisiere jede Sekunde
+            self.recording_start_time = time.time()
+            
+            logging.info("Audioaufnahme gestartet")
+            
+        except Exception as e:
+            error_msg = f"Fehler beim Starten der Audioaufnahme: {str(e)}"
+            logging.error(error_msg)
+            QMessageBox.critical(self, "Fehler", error_msg)
+            raise
+
+    def stop_audio_recording(self):
+        """
+        Stoppt die Audioaufnahme und gibt die aufgenommenen Audiodaten zurück.
+        """
+        try:
+            if self.audio_processor:
+                self.audio_processor.stop_recording()
+                self.audio_visualizer.stop_recording()
+                self.recording_timer.stop()
+                logging.info("Audioaufnahme gestoppt")
+            else:
+                logging.warning("Versuch, die Aufnahme zu stoppen, aber kein AudioProcessor aktiv")
+                
+        except Exception as e:
+            error_msg = f"Fehler beim Stoppen der Audioaufnahme: {str(e)}"
+            logging.error(error_msg)
+            QMessageBox.critical(self, "Fehler", error_msg)
+            raise
+
+    def import_audiobook(self):
+        """Öffnet einen Dialog zur Auswahl eines Audiobooks."""
+        try:
+            folder_path = QFileDialog.getExistingDirectory(
+                self,
+                "Audiobook-Ordner auswählen",
+                "",
+                QFileDialog.Option.ShowDirsOnly
+            )
+            
+            if folder_path:
+                self.on_update_chat("System", f"Starte Import von Audiobook aus: {folder_path}")
+                
+                # Starte den Import-Thread
+                self.import_thread = AudiobookImportThread(
+                    folder_path=folder_path,
+                    whisper_recognizer=self.whisper_recognizer,
+                    learning_manager=self.learning_manager,
+                    parent=self
+                )
+                
+                # Verbinde die Signale
+                self.import_thread.update_status.connect(lambda msg: self.on_update_chat("System", msg))
+                self.import_thread.import_finished.connect(self.on_import_finished)
+                
+                # Starte den Thread
+                self.import_thread.start()
+                
+        except Exception as e:
+            error_msg = f"Fehler beim Importieren des Audiobooks: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            self.on_update_chat("System", error_msg)
+
+    def import_folder(self):
+        """Öffnet einen Dialog zur Auswahl eines Ordners für den Import."""
+        try:
+            folder_path = QFileDialog.getExistingDirectory(
+                self,
+                "Ordner zum Importieren auswählen",
+                "",
+                QFileDialog.Option.ShowDirsOnly
+            )
+            
+            if folder_path:
+                self.on_update_chat("System", f"Starte Import von Ordner: {folder_path}")
+                # Hier würde der Import-Thread für den Ordner gestartet werden
+                
+        except Exception as e:
+            error_msg = f"Fehler beim Importieren des Ordners: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            self.on_update_chat("System", error_msg)
+
+    def import_media(self):
+        """Öffnet einen Dialog zur Auswahl von Medien-Dateien."""
+        try:
+            file_paths, _ = QFileDialog.getOpenFileNames(
+                self,
+                "Medien-Dateien auswählen",
+                "",
+                "Alle Dateien (*);;Bilder (*.jpg *.png);;Videos (*.mp4);;Text (*.txt)"
+            )
+            
+            if file_paths:
+                self.on_update_chat("System", f"Starte Import von {len(file_paths)} Dateien")
+                # Hier würde der Import-Thread für die Medien gestartet werden
+                
+        except Exception as e:
+            error_msg = f"Fehler beim Importieren der Medien: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            self.on_update_chat("System", error_msg)
+
+    def find_and_process_audio_in_folder(self, file_path, learning_manager, whisper_recognizer):
+        """
+        Verarbeitet eine einzelne Audiodatei und fügt sie zur Knowledge Base hinzu.
+        
+        Args:
+            file_path (str): Pfad zur Audiodatei
+            learning_manager (LearningManager): Instanz des LearningManagers
+            whisper_recognizer (WhisperRecognizer): Instanz des WhisperRecognizers
+        """
+        try:
+            # Transkribiere die Audiodatei
+            transcript = whisper_recognizer.transcribe_wav(file_path)
+            
+            if transcript:
+                # Erstelle Metadaten für das Dokument
+                doc_id = str(uuid.uuid4())
+                source_file = os.path.basename(file_path)
+                timestamp = datetime.now().isoformat()
+                
+                # Füge das Transkript zur Knowledge Base hinzu
+                learning_manager.add_to_knowledge_base(
+                    text=transcript,
+                    metadata={
+                        "doc_id": doc_id,
+                        "source_file": source_file,
+                        "timestamp": timestamp,
+                        "type": "audio_transcript"
+                    }
+                )
+                print(f"Audiodatei erfolgreich verarbeitet: {file_path}")
+            else:
+                print(f"Warnung: Transkription fehlgeschlagen für {file_path}")
+                
+        except Exception as e:
+            print(f"Fehler bei der Verarbeitung von {file_path}: {str(e)}")
+            
+class AudiobookImportThread(QThread):
+    """Thread für den Import von Audiobüchern."""
+    update_status = pyqtSignal(str)
+    import_finished = pyqtSignal(int, int)
+
+    def __init__(self, folder_path: str, whisper_recognizer: WhisperRecognizer, learning_manager: LearningManager, parent=None):
+        super().__init__(parent)
+        self.folder_path = folder_path
+        self.whisper_recognizer = whisper_recognizer
+        self.learning_manager = learning_manager
+        self.log_prefix = "[AudiobookImportThread]"
+
+    def run(self):
+        """Führt den Import-Prozess aus."""
+        try:
+            logger.info(f"Starte Import von Audiobüchern aus: {self.folder_path}")
+            self.update_status.emit("Starte Import...")
+            
+            # Prüfe ob Whisper Recognizer initialisiert ist
+            if not self.whisper_recognizer:
+                error_msg = "Whisper Recognizer ist nicht initialisiert. Bitte warten Sie, bis das Modell geladen ist."
+                logger.error(f"{self.log_prefix} {error_msg}")
+                self.update_status.emit(error_msg)
+                self.import_finished.emit(0, 0)
+                return
+                
+            success_count = 0
+            total_count = 0
+            
+            # Verarbeite alle Audio-Dateien im Ordner
+            for root, _, files in os.walk(self.folder_path):
+                for file in files:
+                    if file.lower().endswith(('.mp3', '.wav', '.m4a', '.flac')):
+                        total_count += 1
+                        try:
+                            file_path = os.path.join(root, file)
+                            self.update_status.emit(f"Verarbeite {file}...")
+                            
+                            # Rufe die Funktion mit allen erforderlichen Parametern auf
+                            success = find_and_process_audio_in_folder(
+                                file_path,
+                                self.learning_manager,
+                                self.whisper_recognizer
+                            )
+                            
+                            if success:
+                                success_count += 1
+                                logger.info(f"Erfolgreich importiert: {file}")
+                            else:
+                                logger.warning(f"Fehler beim Import von: {file}")
+                                
+                        except Exception as e:
+                            logger.error(f"Fehler bei der Verarbeitung von {file}: {e}")
+                            
+            logger.info(f"Import abgeschlossen. {success_count} von {total_count} Dateien erfolgreich importiert.")
+            self.update_status.emit("Import abgeschlossen")
+            self.import_finished.emit(success_count, total_count)
+            
+        except Exception as e:
+            logger.error(f"Fehler beim Import-Prozess: {e}")
+            self.update_status.emit(f"Fehler beim Import: {e}")
+            self.import_finished.emit(0, 0)
+
+def find_and_process_audio_in_folder(file_path: str, learning_manager, whisper_recognizer) -> bool:
+    """
+    Verarbeitet eine einzelne Audiodatei und fügt sie zur Wissensbasis hinzu.
+    
+    Args:
+        file_path: Pfad zur Audiodatei
+        learning_manager: Instance des LearningManager
+        whisper_recognizer: Instance des WhisperRecognizer
+    
+    Returns:
+        bool: True wenn erfolgreich, False wenn ein Fehler auftrat
+    """
+    try:
+        # Transkribiere die Audio-Datei
+        transcript = whisper_recognizer.transcribe_wav(file_path)
+        
+        if not transcript:
+            logger.warning(f"Keine Transkription für: {file_path}")
+            return False
+            
+        # Speichere das Transkript in der Wissensbasis
+        learning_manager.add_entry(
+            doc_id=str(uuid.uuid4()),
+            content=transcript,
+            metadata={
+                "entry_type": "audiobook_chunk",
+                "source": os.path.basename(file_path),
+                "timestamp": datetime.now().isoformat()
+            }
+        )
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Fehler bei der Verarbeitung von {file_path}: {e}")
+        return False
+
+    def get_selected_microphone_index(self) -> Optional[int]:
+        """Gibt den Index des aktuell ausgewählten Mikrofons zurück."""
+        try:
+            if hasattr(self, 'selected_mic_index') and self.selected_mic_index is not None:
+                return self.selected_mic_index
+                
+            # Wenn kein Mikrofon ausgewählt ist, versuche ein Standardmikrofon zu finden
+            self.select_default_microphone()
+            return self.selected_mic_index
+            
+        except Exception as e:
+            logger.error(f"Fehler beim Abrufen des Mikrofon-Index: {e}")
+            return None
+
+    def toggle_recording(self):
+        """
+        Startet oder stoppt die Audioaufnahme basierend auf dem aktuellen Aufnahmestatus.
+        Aktualisiert die UI-Elemente entsprechend und behandelt mögliche Fehler.
+        """
+        try:
+            if not self.is_recording:
+                # Überprüfen, ob ein Mikrofon ausgewählt ist
+                if self.get_selected_microphone_index() is None:
+                    raise ValueError("Kein Mikrofon ausgewählt")
+                
+                # Starte die Aufnahme
+                self.record_btn.setText("Aufnahme stoppen")
+                self.is_recording = True
+                self.start_audio_recording()
+            else:
+                # Stoppe die Aufnahme
+                self.record_btn.setText("Aufnahme starten")
+                self.is_recording = False
+                self.stop_audio_recording()
+                
+        except Exception as e:
+            logging.error(f"Fehler beim Umschalten der Aufnahme: {str(e)}")
+            self.is_recording = False
+            self.record_btn.setText("Aufnahme starten")
+            QMessageBox.critical(self, "Fehler", f"Fehler beim Aufnahmevorgang: {str(e)}")
+
+    def send_text_message(self):
+        """Verarbeitet die Texteingabe und sendet sie an den LLM."""
+        try:
+            text = self.text_input.text().strip()
+            if not text:
+                return
+
+            # Generiere eine eindeutige ID für diese Antwort
+            response_id = str(uuid.uuid4())
+            
+            # Speichere den Kontext für River Learning
+            self.interaction_context[response_id] = {"user_input": text}
+
+            self.on_update_chat("Benutzer", text)
+            self.text_input.clear()
+
+            # Starte den Verarbeitungs-Thread
+            self.processing_thread = TextProcessingThread(
+                text=text,
+                llm_manager=self.llm_manager,
+                config=self.config,
+                learning_manager=self.learning_manager,
+                river_learning_manager=self.river_learning_manager,
+                response_id=response_id,
+                parent=self
+            )
+            
+            # Verbinde die Signale
+            self.processing_thread.update_chat.connect(self.on_update_chat)
+            self.processing_thread.trigger_tts.connect(self.on_trigger_tts)
+            self.processing_thread.processing_finished.connect(self.on_processing_finished)
+            
+            # Starte den Thread
+            self.processing_thread.start()
+            
+        except Exception as e:
+            error_msg = f"Fehler bei der Verarbeitung der Texteingabe: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            self.on_update_chat("System", error_msg)
