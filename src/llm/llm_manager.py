@@ -19,6 +19,7 @@ from bs4 import BeautifulSoup
 from .search_manager import SearchManager
 from ..local_packages.nlp_processor import LocalNLPProcessor
 from ..intent_classifier import IntentClassifier # NEU: Importiere IntentClassifier
+from ..utils.secrets_manager import SecretsManager # NEU: Importiere SecretsManager
 
 # Logger für dieses Modul
 logger = logging.getLogger(__name__)
@@ -84,10 +85,17 @@ class LLMManager:
         self.learning_manager = self.learning
         self.online_mode = True  # Standardmäßig online
         
+        # NEU: Secrets laden
+        self.secrets_manager = SecretsManager()
+        self.secrets = self.secrets_manager.load_decrypted_secrets()
+        
         # Debug-Logging für Wetter-Konfiguration
         logger.info("Lade Wetter-API-Konfiguration...")
-        self.weather_api_key = self.config.get('weather.api_key')
-        logger.info(f"Geladener API-Key: {self.weather_api_key}")
+        # Lese Schlüssel aus entschlüsselten Secrets
+        self.weather_api_key = self.secrets.get('weather_api_key')
+        # self.weather_api_key = os.environ.get('WEATHER_API_KEY') or self.config.get('weather.api_key') # Alte Methode
+        if not self.weather_api_key:
+             logger.warning("Kein Wetter-API-Schlüssel in entschlüsselter secrets.json.enc gefunden.")
         self.weather_city = self.config.get('weather.city', fallback='Dresden,01139,DE')
         self.weather_units = self.config.get('weather.units', fallback='metric')
         self.weather_language = self.config.get('weather.language', fallback='de')

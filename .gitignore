@@ -42,6 +42,8 @@ jarvis.log
 .env.local
 config.json  # Oft lokale Konfiguration, ggf. anpassen falls nötig
 config/encryption_key.key # Niemals Schlüssel einchecken!
+encryption.key # NEU: Schlüsseldatei ignorieren
+secrets.json # NEU: Unverschlüsselte Secrets ignorieren
 
 # Datenbanken und Indizes
 *.db
