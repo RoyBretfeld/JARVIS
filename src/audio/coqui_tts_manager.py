@@ -33,11 +33,10 @@ class CoquiTTSManager(BaseTTSManager):
     Verwaltet Text-to-Speech mit Coqui TTS, insbesondere XTTS v2.
     """
     def __init__(self, config):
-        super().__init__()
-        self.config = config # Speichere die Config für späteren Zugriff
-        self.model_name = config.get("tts", "model_name", fallback="tts_models/multilingual/multi-dataset/xtts_v2")
-        # Lese den Pfad zur Referenzstimme aus der Konfiguration
-        self.speaker_wav_path_config = config.get("tts", "speaker_wav_path", fallback="")
+        super().__init__(config)
+        self.model_name = config.get("tts.model_name", fallback="tts_models/multilingual/multi-dataset/xtts_v2")
+        self.speaker_wav_path_config = config.get("tts.speaker_wav_path", fallback="")
+        self.current_speaker_wav_path = self.speaker_wav_path_config
 
         self.tts = None
         self.device = None

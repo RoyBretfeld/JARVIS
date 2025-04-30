@@ -9,6 +9,15 @@
 - Konfiguration des llama3:8b Modells
 - Implementierung der SSML-Unterstützung für gemischte Sprache
 
+### NEU: Datum eintragen (z.B. 2024-07-25)
+- **Intent-Routing implementiert:**
+  - Neue Komponente `intent_classifier.py` erstellt zur Klassifizierung von Nutzer-Intents (code, tech_support, knowledge, chat) mittels Schlüsselwörtern.
+  - `llm_manager.py` erweitert:
+    - `IntentClassifier` integriert.
+    - Methode `process_text` angepasst, um den Intent zu erkennen.
+    - Methode `update_system_prompt` wird aufgerufen, um den System-Prompt für den LLM-Provider dynamisch basierend auf dem erkannten Intent zu setzen.
+    - Spezialisierte Prompts für verschiedene Intents definiert.
+
 ### 2024-03-20
 - Integration von Hermes als lokales LLM
 - Verbesserte Fehlerbehandlung implementiert

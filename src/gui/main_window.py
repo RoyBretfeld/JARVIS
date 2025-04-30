@@ -27,11 +27,11 @@ from ..llm.llm_manager import LLMManager
 from ..llm.learning_manager import LearningManager
 from ..learning.river_learning_manager import RiverLearningManager
 from .mic_selector import MicrophoneSelector
-from ..audio.audio_thread import AudioProcessThread
+from ..audio.audio_thread import AudioProcessThread, AudioRecordingThread
 from .prompt_editor import PromptEditor
 from ..audio.audio_processor import AudioProcessor
 from .loading_screen import LoadingScreen
-from ..audio.base_tts_manager import BaseTTSManager, create_tts_manager
+from ..audio.base_tts_manager import BaseTTSManager
 from ..speech.whisper_recognition import WhisperRecognizer
 from .widgets.status_widget import StatusWidget
 from .audio_settings_widget import AudioSettingsWidget
@@ -40,11 +40,26 @@ import requests
 import subprocess
 import tempfile
 import getpass
+from bs4 import BeautifulSoup
+from scrapy.crawler import CrawlerProcess
+from scrapy.settings import Settings
+from scrapy import signals
+from itemadapter import ItemAdapter
+import crochet
 
 # Logger für dieses Modul
 logger = logging.getLogger(__name__)
 
 class MainWindow(QMainWindow):
+    # Signal für Feedback an den Benutzer (z.B. bei erfolgreichem scheduled run)
+    scheduled_crawl_feedback = pyqtSignal(str)
+    # ---> Neue Signale für AllSpidersRunThread
+    all_spiders_starting = pyqtSignal(str) # spider_name
+    all_spiders_finished_one = pyqtSignal(str, int) # spider_name, exit_code
+    all_spiders_sequence_finished = pyqtSignal()
+    all_spiders_error = pyqtSignal(str) # error_message
+    # <--- Ende Neue Signale
+
     def __init__(self, config_manager, llm_manager, learning_manager, river_learning_manager, task_manager):
         super().__init__()
         logger.info("Initialisiere MainWindow...")
@@ -61,12 +76,20 @@ class MainWindow(QMainWindow):
         self.config["weather_api_key"] = "91ee2d32a13be6a0c1086c8539f8dcf5"
         self.config["weather_city"] = "Dresden"
         
-        # ---> Hole Benutzernamen
+        # ---> Hole Benutzernamen (priorisiert aus Config)
         try:
-            self.username = getpass.getuser()
-            logger.info(f"Benutzername ermittelt: {self.username}")
+            # Versuche, den Namen aus der Config zu lesen
+            configured_name = self.config_manager.get('user_profile', 'display_name')
+            if configured_name and configured_name.strip():
+                self.username = configured_name.strip()
+                logger.info(f"Benutzername aus config.json geladen: {self.username}")
+            else:
+                # Fallback: Windows-Benutzername
+                self.username = getpass.getuser()
+                logger.info(f"Kein display_name in config.json, verwende Windows-Benutzername: {self.username}")
         except Exception as e:
-             logger.warning(f"Konnte Benutzernamen nicht ermitteln: {e}. Verwende 'Benutzer'.")
+             # Fallback bei jeglichem Fehler
+             logger.warning(f"Konnte Benutzernamen nicht ermitteln (weder Config noch System): {e}. Verwende 'Benutzer'.")
              self.username = "Benutzer"
         # <--- Ende Benutzernamen holen
         
@@ -101,6 +124,29 @@ class MainWindow(QMainWindow):
         self.last_response_id = None
         self.interaction_context = {}
         
+        # In __init__ hinzufügen:
+        self.crawler_thread = None
+        self.all_spiders_thread = None # Variable für den neuen Thread
+        
+        # --- Scheduler für Crawls ---
+        self.scheduled_spiders = [
+            "heise_spider",
+            "golem_spider",
+            "t3n_spider",
+            "ct_spider",
+            "computerbase_spider",
+            "chip_spider"
+        ]
+        self.current_scheduled_spider_index = -1 # -1 bedeutet: keine aktive Sequenz
+        self.is_scheduled_crawl_active = False   # Flag, ob eine Sequenz gerade läuft
+        self.crawl_scheduler_timer = QTimer(self)
+        self.crawl_scheduler_timer.timeout.connect(self.start_scheduled_crawl_sequence)
+        # Starte den Timer, alle 1 Stunde (3600000 ms)
+        schedule_interval_ms = 3600 * 1000
+        self.crawl_scheduler_timer.start(schedule_interval_ms)
+        logger.info(f"Crawl-Scheduler initialisiert. Intervall: {schedule_interval_ms / 1000 / 60} Minuten.")
+        # --- Ende Scheduler ---
+        
         # UI initialisieren
         self.init_ui()
         # *** TTS initialisieren ***
@@ -113,7 +159,8 @@ class MainWindow(QMainWindow):
             
             # Setze Fenstertitel und Größe
             self.setWindowTitle("JARVIS - Intelligenter Assistent")
-            self.setMinimumSize(1200, 800)
+            # self.setMinimumSize(1200, 800) # Alte Größe
+            self.resize(1800, 1000) # Neue Größe
             
             # Erstelle zentrales Widget und Layout
             central_widget = QWidget()
@@ -152,6 +199,49 @@ class MainWindow(QMainWindow):
             
             task_group.setLayout(task_layout)
             left_layout.addWidget(task_group)
+
+            # ---> NEUE Gruppe: Autonomes Lernen Status <---
+            learning_status_group = QGroupBox("Autonomes Lernen Status")
+            learning_status_layout = QVBoxLayout()
+
+            # Hauptstatus (Idle, Running, Finished, Error)
+            self.crawler_main_status_label = QLabel("Status: Idle") 
+            # Detail-Status (z.B. aktuelle URL, Anzahl gefundener Items)
+            self.crawler_activity_label = QLabel("Aktivität: -") 
+            self.crawler_activity_label.setWordWrap(True) # Zeilenumbruch erlauben
+            
+            learning_status_layout.addWidget(self.crawler_main_status_label)
+            learning_status_layout.addWidget(self.crawler_activity_label)
+
+            # Buttons zum Starten der Crawls hinzufügen
+            # === Buttons erstellen (bleibt gleich) ===
+            self.start_heise_crawl_btn = QPushButton("Heise Crawl starten")
+            self.start_golem_crawl_btn = QPushButton("Golem Crawl starten")
+            self.start_t3n_crawl_btn = QPushButton("t3n Crawl starten")
+            self.start_ct_crawl_btn = QPushButton("c't Crawl starten")
+            self.start_cb_crawl_btn = QPushButton("CB Crawl starten") # CB = ComputerBase
+            self.start_chip_crawl_btn = QPushButton("Chip Crawl starten")
+
+            # === Buttons direkt zum vertikalen Layout hinzufügen ===
+            learning_status_layout.addWidget(self.start_heise_crawl_btn)
+            learning_status_layout.addWidget(self.start_golem_crawl_btn)
+            learning_status_layout.addWidget(self.start_t3n_crawl_btn)
+            learning_status_layout.addWidget(self.start_ct_crawl_btn)
+            learning_status_layout.addWidget(self.start_cb_crawl_btn)
+            learning_status_layout.addWidget(self.start_chip_crawl_btn)
+            # === Ende direkte Buttons ===
+
+            # ---> NEUER Button hinzufügen
+            self.start_all_spiders_btn = QPushButton("Alle Spider starten")
+            learning_status_layout.addWidget(self.start_all_spiders_btn)
+            # <--- ENDE NEUER Button
+
+            learning_status_layout.addStretch(1) # Fügt Platz am Ende hinzu
+
+            learning_status_group.setLayout(learning_status_layout)
+            left_layout.addWidget(learning_status_group)
+            # ---> ENDE NEUE Gruppe <---
+
             main_layout.addWidget(left_column, 1)  # Stretch-Faktor 1
             
             # Mittlere Spalte: Hauptbereich
@@ -171,37 +261,63 @@ class MainWindow(QMainWindow):
             llm_layout = QHBoxLayout()
             llm_label = QLabel("LLM:")
             self.llm_combo = QComboBox()
-            self.llm_combo.addItem("Ollama")
+            # self.llm_combo.addItem("Ollama") # Alt: Statisch
             llm_layout.addWidget(llm_label)
             llm_layout.addWidget(self.llm_combo)
-            
+
             # Modell Auswahl
             model_label = QLabel("Modell:")
             self.model_combo = QComboBox()
-            self.model_combo.addItem("llama3:8b")
+            # self.model_combo.addItem("llama3:8b") # Alt: Statisch
             self.prompt_edit_btn = QPushButton("Prompt bearbeiten")
             llm_layout.addWidget(model_label)
             llm_layout.addWidget(self.model_combo)
             llm_layout.addWidget(self.prompt_edit_btn)
             status_layout.addLayout(llm_layout)
+
+            # --- Dynamische Befüllung der LLM/Modell-Combos ---
+            self.populate_llm_combos()
+
+            # --- Mikrofon Auswahl wird aus Status entfernt ---
+            # mic_layout = QHBoxLayout()
+            # mic_label = QLabel("Mikrofon:")
+            # self.mic_status = QLabel("Mikrofon (Moman EMP Microphone)")
+            # self.mic_status.setStyleSheet("color: #00ff00")  # Grün für aktives Mikrofon
+            # self.mic_select_btn = QPushButton("Mikrofon auswählen")
+            # self.mic_select_btn.setVisible(True) # Explizit sichtbar machen
+            # logger.debug(f"[UI Debug] mic_select_btn erstellt. Sichtbar: {self.mic_select_btn.isVisible()}, Größe: {self.mic_select_btn.sizeHint()}")
+            # mic_layout.addWidget(mic_label)
+            # mic_layout.addWidget(self.mic_status)
+            # mic_layout.addWidget(self.mic_select_btn)
+            # mic_layout.addStretch() # Füge Stretch hinzu
+            # status_layout.addLayout(mic_layout) # <- Wird entfernt
             
-            # Mikrofon Auswahl
+            status_group.setLayout(status_layout)
+            middle_layout.addWidget(status_group) # Status Gruppe zuerst hinzufügen
+
+            # ---> NEUE Gruppe: Audio-Einstellungen <---
+            audio_group = QGroupBox("Audio-Einstellungen")
+            audio_layout = QVBoxLayout() # Vertikales Layout für diese Gruppe
+
+            # Mikrofon Auswahl (Hier neu erstellen und hinzufügen)
             mic_layout = QHBoxLayout()
             mic_label = QLabel("Mikrofon:")
-            self.mic_status = QLabel("Mikrofon (Moman EMP Microphone)")
-            self.mic_status.setStyleSheet("color: #00ff00")  # Grün für aktives Mikrofon
+            self.mic_status = QLabel("Mikrofon (Moman EMP Microphone)") # Annahme: Init-Wert okay?
+            self.mic_status.setStyleSheet("color: #00ff00")
             self.mic_select_btn = QPushButton("Mikrofon auswählen")
-            self.record_btn = QPushButton("Aufnahme starten")
+            self.mic_select_btn.setVisible(True)
+            # Optional: Debug Logging hier wiederholen, falls gewünscht
             mic_layout.addWidget(mic_label)
             mic_layout.addWidget(self.mic_status)
             mic_layout.addWidget(self.mic_select_btn)
-            mic_layout.addWidget(self.record_btn)
-            status_layout.addLayout(mic_layout)
+            mic_layout.addStretch()
             
-            status_group.setLayout(status_layout)
-            middle_layout.addWidget(status_group)
-            
-            # Wissensbasis Gruppe
+            audio_layout.addLayout(mic_layout) # Füge mic_layout zur neuen Gruppe hinzu
+            audio_group.setLayout(audio_layout)
+            middle_layout.addWidget(audio_group) # Füge neue Gruppe zum Hauptlayout hinzu
+            # ---> ENDE NEUE Gruppe <---
+
+            # ---> WIEDER EINGEFÜGT: Wissensbasis Gruppe <---
             knowledge_group = QGroupBox("Wissensbasis Lernen")
             knowledge_layout = QVBoxLayout()
             
@@ -212,18 +328,19 @@ class MainWindow(QMainWindow):
             knowledge_layout.addWidget(self.import_audio_btn)
             
             # Kompakter Datenbank-Status
-            status_layout = QHBoxLayout()
+            db_status_layout = QHBoxLayout() # Renamed layout variable
             self.db_status_label = QLabel("📚 Einträge:")
             self.db_status_count = QLabel("0")  # Wird durch update_db_status aktualisiert
             self.db_status_label.setStyleSheet("color: #00ff00")  # Grün für aktiv
-            status_layout.addWidget(self.db_status_label)
-            status_layout.addWidget(self.db_status_count)
-            status_layout.addStretch()
-            knowledge_layout.addLayout(status_layout)
+            db_status_layout.addWidget(self.db_status_label)
+            db_status_layout.addWidget(self.db_status_count)
+            db_status_layout.addStretch()
+            knowledge_layout.addLayout(db_status_layout)
             
             knowledge_group.setLayout(knowledge_layout)
             middle_layout.addWidget(knowledge_group)
-            
+            # ---> ENDE WIEDER EINGEFÜGT <---
+
             # Chat Gruppe
             chat_group = QGroupBox("Chat")
             chat_layout = QVBoxLayout()
@@ -238,9 +355,13 @@ class MainWindow(QMainWindow):
             feedback_label = QLabel("War diese Antwort hilfreich?")
             self.thumbs_up_btn = QPushButton("👍")
             self.thumbs_down_btn = QPushButton("👎")
+            self.record_btn = QPushButton("Aufnahme starten") # Definition hier hinzugefügt
+            self.stop_tts_btn = QPushButton("Stop ⏹️") # NEUER Stop-Button
             feedback_layout.addWidget(feedback_label)
             feedback_layout.addWidget(self.thumbs_up_btn)
             feedback_layout.addWidget(self.thumbs_down_btn)
+            feedback_layout.addWidget(self.record_btn)
+            feedback_layout.addWidget(self.stop_tts_btn) # Stop-Button hinzufügen
             feedback_layout.addStretch()
             chat_layout.addLayout(feedback_layout)
             
@@ -248,10 +369,29 @@ class MainWindow(QMainWindow):
             input_layout = QHBoxLayout()
             self.chat_input = QLineEdit()
             self.chat_input.setPlaceholderText("Nachricht eingeben...")
+            # Setze die Höhe für ca. 3 Zeilen (Annahme: ca. 25px pro Zeile)
+            self.chat_input.setFixedHeight(75)
             self.send_btn = QPushButton("Senden")
             input_layout.addWidget(self.chat_input)
             input_layout.addWidget(self.send_btn)
             chat_layout.addLayout(input_layout)
+            
+            # --- NEU: Layout für Aktions-Buttons UNTER dem Input ---
+            action_button_layout = QHBoxLayout()
+            # Erstelle die Buttons (falls sie oben komplett entfernt wurden)
+            self.create_image_btn = QPushButton("🖼️ Bild")
+            self.create_video_btn = QPushButton("🎬 Video")
+            self.voice_agent_btn = QPushButton("🗣️ Voice Agent")
+            self.create_image_btn.setToolTip("Neues Bild generieren")
+            self.create_video_btn.setToolTip("Neues Video generieren")
+            self.voice_agent_btn.setToolTip("Voice Agent starten/konfigurieren")
+            # Füge Buttons zum neuen Layout hinzu
+            action_button_layout.addWidget(self.create_image_btn)
+            action_button_layout.addWidget(self.create_video_btn)
+            action_button_layout.addWidget(self.voice_agent_btn)
+            action_button_layout.addStretch() # Füge Platz rechts hinzu
+            chat_layout.addLayout(action_button_layout) # Füge das neue Layout zum Chat-Layout hinzu
+            # --- Ende Aktions-Buttons Layout ---
             
             chat_group.setLayout(chat_layout)
             middle_layout.addWidget(chat_group)
@@ -327,7 +467,9 @@ class MainWindow(QMainWindow):
             
             # Status und Ergebnis
             self.web_status = QLabel("Bereit")
-            self.web_result = QLabel("Ergebnis")
+            self.web_result = QTextEdit()
+            self.web_result.setReadOnly(True)
+            self.web_result.setPlaceholderText("Webseiten-Inhalt wird hier angezeigt...")
             
             # Aktions-Buttons
             web_buttons_layout = QHBoxLayout()
@@ -348,11 +490,23 @@ class MainWindow(QMainWindow):
             # Statusleiste
             self.statusBar = QStatusBar()
             self.setStatusBar(self.statusBar)
-            
-            # System-Auslastung in der Statusleiste
-            self.system_stats = QLabel("CPU: 2.9% | RAM: 34.7% | GPU: --% | Modell: -- | DB: 36120.5 MB")
+
+            # --- NEU: Aktions-Buttons zur Statusleiste hinzufügen (links) ---
+            # self.create_image_btn = QPushButton("🖼️ Bild")
+            # self.create_video_btn = QPushButton("🎬 Video")
+            # self.voice_agent_btn = QPushButton("🗣️ Voice Agent")
+            # self.create_image_btn.setToolTip("Neues Bild generieren")
+            # self.create_video_btn.setToolTip("Neues Video generieren")
+            # self.voice_agent_btn.setToolTip("Voice Agent starten/konfigurieren")
+            # self.statusBar.addWidget(self.create_image_btn)
+            # self.statusBar.addWidget(self.create_video_btn)
+            # self.statusBar.addWidget(self.voice_agent_btn)
+            # --- Ende Aktions-Buttons ---
+
+            # System-Auslastung in der Statusleiste (rechts)
+            self.system_stats = QLabel("CPU: --% | RAM: --% | GPU: --% | Modell: -- | DB: -- MB") # Initiale Werte
             self.statusBar.addPermanentWidget(self.system_stats)
-            
+
             # Signal-Verbindungen
             self.setup_connections()
             
@@ -361,6 +515,63 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Fehler beim Initialisieren der UI: {e}", exc_info=True)
             raise
+
+    def populate_llm_combos(self):
+        """Befüllt die LLM- und Modell-Dropdowns dynamisch."""
+        try:
+            # Lösche alte Einträge
+            self.llm_combo.clear()
+            self.model_combo.clear()
+
+            if self.llm_manager:
+                # Befülle LLM Provider Combo
+                available_providers = self.llm_manager.get_available_providers()
+                current_provider_name = self.llm_manager.get_provider()
+                
+                if available_providers:
+                    self.llm_combo.addItems(available_providers)
+                    if current_provider_name in available_providers:
+                         self.llm_combo.setCurrentText(current_provider_name)
+                    else:
+                         logger.warning(f"Aktiver Provider '{current_provider_name}' nicht in der Liste der verfügbaren Provider?")
+                         if available_providers: # Setze den ersten als Fallback
+                             self.llm_combo.setCurrentIndex(0)
+                else:
+                     self.llm_combo.addItem("Keine Provider")
+                     self.llm_combo.setEnabled(False)
+                
+                # Befülle Modell Combo basierend auf aktivem Provider
+                available_models = self.llm_manager.get_available_models()
+                current_model_name = self.llm_manager.get_current_model()
+                
+                if available_models:
+                    self.model_combo.addItems(available_models)
+                    if current_model_name in available_models:
+                        self.model_combo.setCurrentText(current_model_name)
+                    else:
+                        logger.warning(f"Aktives Modell '{current_model_name}' nicht in der Liste der verfügbaren Modelle?")
+                        if available_models: # Setze das erste als Fallback
+                             self.model_combo.setCurrentIndex(0)
+                else:
+                     self.model_combo.addItem("Keine Modelle")
+                     self.model_combo.setEnabled(False)
+            else:
+                 # Fallback, wenn LLM Manager nicht initialisiert ist
+                 self.llm_combo.addItem("Fehler")
+                 self.model_combo.addItem("Fehler")
+                 self.llm_combo.setEnabled(False)
+                 self.model_combo.setEnabled(False)
+                 logger.error("LLMManager nicht verfügbar zum Befüllen der Comboboxen.")
+                 
+        except Exception as e:
+            logger.error(f"Fehler beim Befüllen der LLM/Modell-Comboboxen: {e}", exc_info=True)
+            # Setze Fehlerstatus in Comboboxen
+            self.llm_combo.clear()
+            self.model_combo.clear()
+            self.llm_combo.addItem("Fehler")
+            self.model_combo.addItem("Fehler")
+            self.llm_combo.setEnabled(False)
+            self.model_combo.setEnabled(False)
 
     def setup_connections(self):
         """Verbindet alle Signale mit ihren Slots"""
@@ -391,6 +602,31 @@ class MainWindow(QMainWindow):
             self.search_btn.clicked.connect(self.search_url)
             self.save_btn.clicked.connect(self.save_web_result)
             self.clear_btn.clicked.connect(self.clear_web_result)
+            
+            # Autonomes Lernen
+            self.start_heise_crawl_btn.clicked.connect(self.trigger_heise_crawl)
+            self.start_golem_crawl_btn.clicked.connect(self.trigger_golem_crawl)
+            # === NEUE Verbindungen ===
+            self.start_t3n_crawl_btn.clicked.connect(self.trigger_t3n_crawl)
+            self.start_ct_crawl_btn.clicked.connect(self.trigger_ct_crawl)
+            self.start_cb_crawl_btn.clicked.connect(self.trigger_cb_crawl)
+            self.start_chip_crawl_btn.clicked.connect(self.trigger_chip_crawl)
+            # === ENDE NEUE Verbindungen ===
+
+            # ---> Verbindung für neuen Button
+            self.start_all_spiders_btn.clicked.connect(self.trigger_all_spiders_sequentially)
+            # <--- ENDE Verbindung
+
+            # Verbinde das neue Feedback-Signal
+            self.scheduled_crawl_feedback.connect(self.show_scheduled_crawl_feedback)
+            
+            # Verbinde die neuen Button-Signale
+            self.create_image_btn.clicked.connect(self.on_create_image_clicked)
+            self.create_video_btn.clicked.connect(self.on_create_video_clicked)
+            self.voice_agent_btn.clicked.connect(self.on_voice_agent_clicked) # Geändert
+            
+            # NEU: Verbindung für Stop TTS Button
+            self.stop_tts_btn.clicked.connect(self.on_stop_tts_clicked)
             
         except Exception as e:
             logger.error(f"Fehler beim Verbinden der Signale: {e}")
@@ -443,22 +679,73 @@ class MainWindow(QMainWindow):
             logger.error(f"Fehler beim Senden des Feedbacks: {e}")
 
     def search_url(self):
-        """Führt eine URL-Suche durch"""
-        try:
-            url = self.url_input.text().strip()
-            if url:
-                self.web_status.setText("Suche läuft...")
-                # Hier die URL-Suche implementieren
-        except Exception as e:
-            logger.error(f"Fehler bei der URL-Suche: {e}")
+        """Startet den Thread zum Abrufen einer URL."""
+        url = self.url_input.text().strip()
+        if not url:
+            self.web_status.setText("Bitte URL eingeben.")
+            return
+            
+        # Füge http:// hinzu, falls es fehlt (einfache Prüfung)
+        if not url.startswith('http://') and not url.startswith('https://'):
+            url = 'http://' + url
+            self.url_input.setText(url) # Aktualisiere das Feld
+            
+        self.web_status.setText(f"Suche {url}...")
+        self.web_result.clear() # Altes Ergebnis löschen
+        QApplication.processEvents() # UI kurz aktualisieren
+        
+        # Prüfen ob bereits ein Thread läuft
+        if hasattr(self, 'url_fetch_thread') and self.url_fetch_thread and self.url_fetch_thread.isRunning():
+             logger.warning("Ein URL-Abruf läuft bereits.")
+             self.web_status.setText("Ein anderer Abruf läuft bereits...")
+             return
+             
+        # ---> Starte den Thread
+        self.url_fetch_thread = UrlFetchThread(url, parent=self)
+        self.url_fetch_thread.content_ready.connect(self.on_url_content_ready)
+        self.url_fetch_thread.error_occurred.connect(self.on_url_fetch_error)
+        # Optional: Thread automatisch löschen, wenn er fertig ist
+        self.url_fetch_thread.finished.connect(self.url_fetch_thread.deleteLater) 
+        self.url_fetch_thread.start()
+        # <--- Ende Thread-Start
 
     def save_web_result(self):
-        """Speichert das Web-Ergebnis"""
+        """Startet den Thread zum Speichern des Webinhalts aus self.web_result."""
+        # ---> Code zum direkten Speichern ENTFERNT <--- 
         try:
-            self.web_status.setText("Speichern...")
-            # Hier das Speichern implementieren
+            html_content = self.web_result.toPlainText()
+            current_url = self.url_input.text().strip() # Hole die URL für Metadaten
+
+            if not html_content or html_content.startswith("Fehler:") or html_content.startswith("Unerwarteter Fehler:"):
+                self.web_status.setText("Kein gültiger Inhalt zum Speichern.")
+                logger.warning("Versuch, ungültigen Webinhalt zu speichern.")
+                return
+
+            # Prüfen ob bereits ein Speicher-Thread läuft
+            if hasattr(self, 'web_save_thread') and self.web_save_thread and self.web_save_thread.isRunning():
+                logger.warning("Ein Web-Speicherprozess läuft bereits.")
+                self.web_status.setText("Ein anderer Speicherprozess läuft bereits...")
+                return
+                
+            self.web_status.setText("Starte Speichervorgang...")
+            QApplication.processEvents() # UI kurz aktualisieren
+
+            # ---> Starte den Speicher-Thread
+            self.web_save_thread = WebSaveThread(
+                html_content=html_content,
+                source_url=current_url,
+                learning_manager=self.learning_manager,
+                parent=self
+            )
+            self.web_save_thread.save_success.connect(self.on_web_save_success)
+            self.web_save_thread.save_error.connect(self.on_web_save_error)
+            self.web_save_thread.finished.connect(self.web_save_thread.deleteLater)
+            self.web_save_thread.start()
+            # <--- Ende Thread-Start
+
         except Exception as e:
-            logger.error(f"Fehler beim Speichern des Web-Ergebnisses: {e}")
+            logger.error(f"Fehler beim Starten des Web-Speicher-Threads: {e}", exc_info=True)
+            self.web_status.setText("Fehler beim Starten des Speicherns.")
 
     def clear_web_result(self):
         """Löscht das Web-Ergebnis"""
@@ -541,6 +828,9 @@ class MainWindow(QMainWindow):
             self.import_thread.import_error.connect(
                 lambda msg: QMessageBox.critical(self, "Fehler", msg))
                 
+            # Korrigierter Aufruf
+            # self.statusBar().showMessage("Starte Wissensimport...")
+            self.statusBar.showMessage("Starte Wissensimport...")
             self.import_thread.start()
             
         except Exception as e:
@@ -563,6 +853,8 @@ class MainWindow(QMainWindow):
             if file_name:
                 with open(file_name, 'w', encoding='utf-8') as f:
                     f.write(self.chat_area.toPlainText())
+                # Korrigierter Aufruf
+                # self.statusBar().showMessage("Konversation exportiert")
                 self.statusBar.showMessage("Konversation exportiert")
                 
         except Exception as e:
@@ -761,50 +1053,54 @@ class MainWindow(QMainWindow):
             logger.error(f"Fehler beim Initialisieren der Audio-Komponenten: {e}")
 
     def init_tts(self):
-        """Initialisiert die Text-to-Speech-Komponenten"""
-        self.tts_manager = None # Explizit initialisieren
-        try:
-            logger.info(f"Versuche TTS-Manager mit der aktuellen Konfiguration zu initialisieren...")
-            # Übergebe das gesamte Konfigurationsobjekt
-            manager = create_tts_manager(self.config)
-            
-            if manager:
-                self.tts_manager = manager
-                tts_engine_used = self.config.get("tts", {}).get("engine", "unbekannt") # Versuche, die verwendete Engine zu loggen
-                logger.info(f"TTS-Manager ({tts_engine_used}) erfolgreich initialisiert.")
-                
-                # Hauptsignal verbinden
-                if hasattr(self.tts_manager, 'tts_finished'):
-                    self.tts_manager.tts_finished.connect(self.on_tts_finished)
-                else:
-                    logger.warning(f"TTS Manager ({tts_engine_used}) hat kein 'tts_finished' Signal.")
-                
-                # Optionale Signale verbinden
-                if hasattr(self.tts_manager, 'tts_error'):
-                     self.tts_manager.tts_error.connect(self.on_tts_error)
-                if hasattr(self.tts_manager, 'tts_progress'):
-                     self.tts_manager.tts_progress.connect(self.on_tts_progress)
-                     
-                logger.info(f"TTS-Manager ({tts_engine_used}): Signale verbunden.")
-            else:
-                # create_tts_manager loggt den Fehler bereits
-                logger.warning("TTS Manager konnte nicht initialisiert werden (siehe vorherige Logs). TTS nicht verfügbar.")
-                self.tts_manager = None # Sicherstellen, dass es None ist
+        """Initialisiert das TTS System."""
+        # Stelle sicher, dass die Konfiguration existiert
+        # ... (Fehlerbehandlung für Config fehlt hier, aber ok für jetzt)
 
-        except Exception as e:
-            logger.error(f"Unerwarteter Fehler beim Initialisieren der Text-to-Speech-Komponenten: {e}", exc_info=True)
-            self.tts_manager = None # Sicherstellen, dass es None im Fehlerfall ist
+        use_tts = self.config_manager.get('tts.use_tts', True) # Lese TTS-Flag
+
+        if use_tts:
+            logger.info("Initialisiere TTS Manager...")
+            # TTS Manager erstellen
+            # Verwende die korrekte Config-Instanz
+            # self.tts_manager = create_tts_manager(self.config_manager) # Alt
+            self.tts_manager = BaseTTSManager.create(self.config_manager) # Neu
+
+            if self.tts_manager:
+                if self.tts_manager.check_readiness():
+                    # Hauptsignal verbinden
+                    if hasattr(self.tts_manager, 'tts_finished'):
+                        self.tts_manager.tts_finished.connect(self.on_tts_finished)
+                    else:
+                        logger.warning(f"TTS Manager hat kein 'tts_finished' Signal.")
+                    
+                    # Optionale Signale verbinden
+                    if hasattr(self.tts_manager, 'tts_error'):
+                         self.tts_manager.tts_error.connect(self.on_tts_error)
+                    if hasattr(self.tts_manager, 'tts_progress'):
+                         self.tts_manager.tts_progress.connect(self.on_tts_progress)
+                         
+                    logger.info(f"TTS-Manager ({self.tts_manager.__class__.__name__}): Signale verbunden.")
+                else:
+                    logger.warning("TTS Manager ist nicht bereit. Überprüfen Sie die Konfiguration.")
+        else:
+            logger.warning("TTS ist deaktiviert. Sprachausgabe wird übersprungen.")
+            self.tts_manager = None
 
     def on_recording_started(self):
         """Handler für Aufnahmestart"""
         self.is_recording = True
         self.record_btn.setChecked(True)
+        # Korrigierter Aufruf
+        # self.statusBar().showMessage("Aufnahme läuft...")
         self.statusBar.showMessage("Aufnahme läuft...")
         
     def on_recording_stopped(self):
         """Handler für Aufnahmestopp"""
         self.is_recording = False
         self.record_btn.setChecked(False)
+        # Korrigierter Aufruf
+        # self.statusBar().showMessage("Aufnahme gestoppt")
         self.statusBar.showMessage("Aufnahme gestoppt")
         
     def on_audio_data(self, data):
@@ -890,7 +1186,28 @@ class MainWindow(QMainWindow):
             selector = MicrophoneSelector(self)
             if selector.exec() == QDialog.DialogCode.Accepted:
                 device_index = selector.get_selected_device_index()
-                self.mic_combo.setCurrentText(f"Mikrofon: {device_index}")
+                device_name = selector.get_selected_device_name() # Annahme: Methode existiert oder wird hinzugefügt
+                
+                if device_index is not None and device_name is not None:
+                    logger.info(f"Mikrofon ausgewählt: Index={device_index}, Name='{device_name}'")
+                    # Aktualisiere das Status-Label
+                    self.mic_status.setText(f"Mikrofon: {device_name}")
+                    self.mic_status.setStyleSheet("color: #00ff00") # Grün setzen
+                    
+                    # Aktualisiere die Konfiguration
+                    try:
+                        self.config_manager.set_microphone(device_index, device_name)
+                        # Optional: Neustart des Audio-Threads erzwingen, falls er läuft?
+                        # if self.is_recording:
+                        #     self.stop_recording()
+                        #     self.toggle_recording() # Oder eine spezifischere Update-Methode
+                    except Exception as config_e:
+                        logger.error(f"Fehler beim Speichern der Mikrofon-Konfiguration: {config_e}")
+                        QMessageBox.warning(self, "Fehler", "Mikrofon-Einstellung konnte nicht gespeichert werden.")
+                else:
+                     logger.warning("Kein gültiges Mikrofon im Dialog ausgewählt.")
+                     self.mic_status.setStyleSheet("color: #ffa500") # Orange für unklaren Status
+
         except Exception as e:
             logger.error(f"Fehler beim Anzeigen der Mikrofon-Auswahl: {e}")
 
@@ -917,7 +1234,7 @@ class MainWindow(QMainWindow):
                      self.llm_manager.reload_prompts()
                      logger.info("LLMManager: Prompts neu geladen.")
                 else:
-                     # Fallback: Wir holen den formatierten Prompt direkt nach dem Speichern,
+                     # Fallback: Wir holen den NEU formatierten System-Prompt direkt nach dem Speichern,
                      # basierend auf der Annahme, dass der LLMManager beim nächsten get_system_prompt
                      # die Daten korrekt formatiert.
                      logger.warning("LLMManager hat keine reload_prompts Methode. Aktualisiere Provider direkt.")
@@ -964,9 +1281,8 @@ class MainWindow(QMainWindow):
             # <--- Ende ÄNDERUNG
 
             # Starte Verarbeitung in separatem Thread
-            self.audio_processing_thread = AudioProcessingThread(
+            self.audio_processing_thread = AudiobookImportThread(
                 folder_path=folder,
-                chunk_size=60,  # 60 Sekunden Chunks
                 learning_manager=self.learning_manager,
                 whisper_recognizer=self.whisper_recognizer,
                 parent=self
@@ -1161,13 +1477,619 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Fehler beim Aktualisieren der Statusleiste: {e}")
 
+    # ---> Slots für URL Fetch Thread
+    @pyqtSlot(str)
+    def on_url_content_ready(self, content):
+        """Wird aufgerufen, wenn der UrlFetchThread den Inhalt erfolgreich abgerufen hat."""
+        self.web_result.setText(content)
+        self.web_status.setText(f"Inhalt geladen.")
+        self.url_fetch_thread = None # Thread-Referenz löschen
+        
+        # Optional: Automatisch speichern, wenn Checkbox aktiviert ist
+        if self.auto_save.isChecked():
+             self.save_web_result() # Rufe die Speicherfunktion auf
+             
+    @pyqtSlot(str)
+    def on_url_fetch_error(self, error_message):
+        """Wird aufgerufen, wenn beim URL-Abruf ein Fehler aufgetreten ist."""
+        self.web_result.setText(error_message)
+        self.web_status.setText("Fehler beim Laden.")
+        self.url_fetch_thread = None # Thread-Referenz löschen
+    # <--- Ende Slots
+
+    # ---> Slots für Web Save Thread
+    @pyqtSlot(str)
+    def on_web_save_success(self, url):
+        """Wird aufgerufen, wenn der WebSaveThread erfolgreich gespeichert hat."""
+        logger.info(f"Web-Inhalt von {url} erfolgreich hinzugefügt (via Thread).")
+        self.web_status.setText("Inhalt erfolgreich gespeichert.")
+        self.update_db_status() # DB-Status aktualisieren
+        self.web_save_thread = None # Thread-Referenz löschen
+
+    @pyqtSlot(str)
+    def on_web_save_error(self, error_message):
+        """Wird aufgerufen, wenn beim Speichern des Webinhalts ein Fehler aufgetreten ist."""
+        logger.error(f"Fehler beim Speichern des Web-Inhalts (via Thread): {error_message}")
+        self.web_status.setText(f"Fehler: {error_message}")
+        self.web_save_thread = None # Thread-Referenz löschen
+    # <--- Ende Slots
+
+    # === Methoden für Scrapy Crawler ===
+
+    def _start_crawl(self, spider_name):
+        """Interne Methode zum Starten eines Crawl-Threads."""
+        if self.crawler_thread and self.crawler_thread.isRunning():
+            QMessageBox.warning(self, "Crawl läuft bereits", "Es läuft bereits ein Crawl-Prozess. Bitte warten Sie.")
+            return
+
+        # Status basierend darauf setzen, ob es ein geplanter oder manueller Lauf ist
+        if self.is_scheduled_crawl_active:
+            status_text = f"Scheduler: Starte {spider_name}..."
+            # Buttons sind bereits deaktiviert durch run_next_scheduled_spider
+        else:
+            status_text = f"Starte {spider_name} Crawl..."
+            self.set_crawl_buttons_enabled(False) # Manuelle Buttons deaktivieren
+            
+        # Korrigierter Aufruf: Zeige temporäre Nachricht in der Statusleiste
+        self.statusBar.showMessage(status_text, 5000) # Korrekt: ohne () nach statusBar
+        self.crawler_main_status_label.setText("Status: Running...")
+        self.crawler_activity_label.setText(f"Spider: {spider_name}")
+
+        logger.info(f"Starte {spider_name} Crawl-Thread...")
+        self.crawler_thread = ScrapyCrawlerThread(spider_name, self.learning_manager, self.config)
+
+        # Verbinde die Signale des Threads mit den Slots der MainWindow
+        self.crawler_thread.crawl_started.connect(self.on_crawl_started)
+        self.crawler_thread.status_update.connect(self.on_crawl_status_update)
+        self.crawler_thread.item_processed.connect(self.on_crawl_item_processed)
+        # Wichtig: _crawl_finished ist jetzt der zentrale Punkt!
+        self.crawler_thread.crawl_finished.connect(self._crawl_finished)
+        self.crawler_thread.crawl_error.connect(self.on_crawl_error)
+        # Signal hinzufügen, wenn der Thread tatsächlich beendet ist
+        self.crawler_thread.finished.connect(self.on_thread_actually_finished)
+
+        self.crawler_thread.start()
+
+    # --- Trigger für manuelle Crawls ---
+    def trigger_heise_crawl(self):
+        """Startet den Heise-Crawl manuell."""
+        if not self.is_scheduled_crawl_active: # Nur starten, wenn kein Scheduler läuft
+            self._start_crawl("heise_spider")
+        else:
+            self.statusBar().showMessage("Geplanter Crawl aktiv, manueller Start nicht möglich.", 3000)
+
+    def trigger_golem_crawl(self):
+        """Startet den Golem-Crawl manuell."""
+        if not self.is_scheduled_crawl_active:
+            self._start_crawl("golem_spider")
+        else:
+            self.statusBar().showMessage("Geplanter Crawl aktiv, manueller Start nicht möglich.", 3000)
+
+    # === NEUE Trigger-Methoden ===
+    def trigger_t3n_crawl(self):
+        """Startet den t3n-Crawl manuell."""
+        if not self.is_scheduled_crawl_active:
+            self._start_crawl("t3n_spider")
+        else:
+            self.statusBar().showMessage("Geplanter Crawl aktiv, manueller Start nicht möglich.", 3000)
+
+    def trigger_ct_crawl(self):
+        """Startet den c't-Crawl manuell."""
+        if not self.is_scheduled_crawl_active:
+            self._start_crawl("ct_spider")
+        else:
+            self.statusBar().showMessage("Geplanter Crawl aktiv, manueller Start nicht möglich.", 3000)
+
+    def trigger_cb_crawl(self):
+        """Startet den ComputerBase-Crawl manuell."""
+        if not self.is_scheduled_crawl_active:
+            self._start_crawl("computerbase_spider")
+        else:
+            self.statusBar().showMessage("Geplanter Crawl aktiv, manueller Start nicht möglich.", 3000)
+
+    def trigger_chip_crawl(self):
+        """Startet den Chip-Crawl manuell."""
+        if not self.is_scheduled_crawl_active:
+            self._start_crawl("chip_spider")
+        else:
+            self.statusBar().showMessage("Geplanter Crawl aktiv, manueller Start nicht möglich.", 3000)
+    # === ENDE NEUE Trigger-Methoden ===
+
+    def set_crawl_buttons_enabled(self, enabled):
+        """Aktiviert oder deaktiviert die manuellen Crawl-Startbuttons."""
+        self.start_heise_crawl_btn.setEnabled(enabled)
+        self.start_golem_crawl_btn.setEnabled(enabled)
+        self.start_t3n_crawl_btn.setEnabled(enabled)
+        self.start_ct_crawl_btn.setEnabled(enabled)
+        self.start_cb_crawl_btn.setEnabled(enabled)
+        self.start_chip_crawl_btn.setEnabled(enabled)
+        # ---> Neuen Button hinzufügen
+        if hasattr(self, 'start_all_spiders_btn'): # Sicherstellen, dass der Button existiert
+            self.start_all_spiders_btn.setEnabled(enabled)
+        # <--- ENDE Neuer Button
+
+    # --- Slots für Crawl-Thread-Signale ---
+    @pyqtSlot()
+    def on_crawl_started(self):
+        """Slot, der aufgerufen wird, wenn der Scrapy-Prozess im Thread gestartet wurde."""
+        logger.info("Crawl-Prozess gestartet (Signal empfangen).")
+        # Status wurde bereits in _start_crawl gesetzt
+
+    @pyqtSlot(str)
+    def on_crawl_status_update(self, message):
+        """Aktualisiert die Detail-Statusanzeige."""
+        self.crawler_activity_label.setText(f"Aktivität: {message}")
+
+    @pyqtSlot(str)
+    def on_crawl_item_processed(self, url):
+        """Aktualisiert die Anzeige, wenn ein Item verarbeitet wurde."""
+        # Zeige nur die letzten paar Zeichen der URL, um Platz zu sparen
+        display_url = url if len(url) < 50 else "..." + url[-47:]
+        self.crawler_activity_label.setText(f"Gefunden: {display_url}")
+        # Optional: Zähler für gefundene Items hinzufügen
+
+    # ANGEPASST: Dieser Slot behandelt das Ende und triggert ggf. den nächsten geplanten Crawl
+    @pyqtSlot(str, str)
+    def _crawl_finished(self, spider_name, reason):
+        """Slot, der aufgerufen wird, wenn ein Spider (im Thread) beendet wurde."""
+        logger.info(f"Crawl für {spider_name} beendet. Grund: {reason}")
+        final_status = f"Status: Finished ({spider_name})"
+        self.crawler_main_status_label.setText(final_status)
+        self.crawler_activity_label.setText(f"Grund: {reason}")
+
+        # Prüfe, ob dies Teil einer aktiven, geplanten Sequenz war
+        if self.is_scheduled_crawl_active and self.current_scheduled_spider_index != -1:
+            expected_spider = self.scheduled_spiders[self.current_scheduled_spider_index]
+            if spider_name == expected_spider:
+                self.logger.info(f"Scheduler: {spider_name} erfolgreich beendet. Starte nächsten...")
+                self.current_scheduled_spider_index += 1
+                # Starte den nächsten Spider mit kurzer Verzögerung
+                QTimer.singleShot(500, self.run_next_scheduled_spider) # 500ms Pause
+            else:
+                # Unerwarteter Spider beendet während der Sequenz - Sequenz abbrechen
+                self.logger.warning(f"Scheduler: Unerwarteter Crawl ({spider_name}) beendet. Erwartet: {expected_spider}. Breche Sequenz ab.")
+                self.is_scheduled_crawl_active = False
+                self.current_scheduled_spider_index = -1
+                self.set_crawl_buttons_enabled(True) # Buttons wieder freigeben
+                # Korrigierter Aufruf
+                # self.statusBar().showMessage("Scheduler: Crawl-Sequenz abgebrochen (Fehler).", 5000)
+                self.statusBar.showMessage("Scheduler: Crawl-Sequenz abgebrochen (Unerwarteter Crawl).", 5000)
+        else:
+            # Ende eines manuellen Crawls oder die Sequenz war nicht aktiv/schon beendet
+            logger.debug("Manueller Crawl beendet. Rufe set_crawl_buttons_enabled(True) auf...") # DEBUG LOGGING
+            self.set_crawl_buttons_enabled(True)
+
+    @pyqtSlot()
+    def on_thread_actually_finished(self):
+        """Slot der aufgerufen wird, wenn der QThread selbst beendet ist."""
+        # Wird aufgerufen *nachdem* der Thread run() beendet hat.
+        # Kann für Aufräumarbeiten genutzt werden, falls nötig.
+        logger.debug("ScrapyCrawlerThread tatsächlich beendet.")
+        # Hier keine Buttons aktivieren, das passiert in _crawl_finished oder on_crawl_error
+
+    @pyqtSlot(str, str)
+    def on_crawl_error(self, spider_name, error_message):
+        """Slot, der bei einem Fehler im Crawl-Prozess aufgerufen wird."""
+        logger.error(f"Fehler im Crawl-Prozess ({spider_name}): {error_message}")
+        self.crawler_main_status_label.setText(f"Status: Error ({spider_name})")
+        self.crawler_activity_label.setText(f"Fehler: {error_message[:100]}...") # Begrenze Fehlermeldung
+        QMessageBox.critical(self, "Crawl Fehler", f"Fehler beim Crawlen mit {spider_name}:\n{error_message}")
+
+        # Wenn ein Fehler während einer geplanten Sequenz auftritt -> Sequenz abbrechen
+        if self.is_scheduled_crawl_active:
+            self.logger.warning(f"Scheduler: Fehler bei {spider_name}. Breche Crawl-Sequenz ab.")
+            self.is_scheduled_crawl_active = False
+            self.current_scheduled_spider_index = -1
+            # Korrigierter Aufruf
+            # self.statusBar().showMessage("Scheduler: Crawl-Sequenz abgebrochen (Fehler).", 5000)
+            self.statusBar.showMessage("Scheduler: Crawl-Sequenz abgebrochen (Fehler).", 5000)
+
+        # Buttons immer wieder aktivieren bei Fehler
+        self.set_crawl_buttons_enabled(True)
+    # --- Ende Slots für Crawl-Thread-Signale ---
+
+    # --- Scheduler-Methoden ---
+    @pyqtSlot()
+    def start_scheduled_crawl_sequence(self):
+        """Wird vom Timer aufgerufen, um eine neue Crawl-Sequenz zu starten."""
+        if self.is_scheduled_crawl_active:
+            self.logger.info("Ein geplanter Crawl-Lauf ist bereits aktiv. Überspringe diesen Zyklus.")
+            return
+        
+        # Prüfe, ob ein manueller Crawl läuft (optional, aber sinnvoll)
+        if self.crawler_thread and self.crawler_thread.isRunning():
+             self.logger.info("Ein manueller Crawl-Lauf ist aktiv. Überspringe geplanten Start.")
+             return
+
+        self.logger.info(f"Starte geplanter Crawl-Lauf für {len(self.scheduled_spiders)} Spider.")
+        self.is_scheduled_crawl_active = True
+        self.current_scheduled_spider_index = 0
+        # Korrigierter Aufruf: Zeige temporäre Nachricht in der Statusleiste
+        # self.statusBar().showMessage("Scheduler: Starte Crawl-Sequenz...", 5000) # 5 Sek anzeigen
+        self.statusBar.showMessage("Scheduler: Starte Crawl-Sequenz...", 5000) # Korrekt: ohne () nach statusBar
+        self.run_next_scheduled_spider() # Starte den ersten Spider
+
+    def run_next_scheduled_spider(self):
+        """Startet den nächsten Spider in der geplanten Sequenz."""
+        if not self.is_scheduled_crawl_active or self.current_scheduled_spider_index >= len(self.scheduled_spiders):
+            if self.is_scheduled_crawl_active: # Nur loggen/Feedback geben, wenn die Sequenz aktiv war
+                 self.logger.info("Geplanter Crawl-Lauf erfolgreich beendet.")
+                 self.scheduled_crawl_feedback.emit("Geplanter Crawl-Lauf für alle Spider beendet.")
+            self.is_scheduled_crawl_active = False
+            self.current_scheduled_spider_index = -1
+            # Buttons wieder aktivieren, falls sie deaktiviert wurden
+            self.set_crawl_buttons_enabled(True)
+            return
+
+        spider_name = self.scheduled_spiders[self.current_scheduled_spider_index]
+        self.logger.info(f"Scheduler: Starte Crawl für Spider {spider_name} ({self.current_scheduled_spider_index + 1}/{len(self.scheduled_spiders)})...")
+        
+        # Deaktiviere manuelle Startbuttons während der Sequenz
+        self.set_crawl_buttons_enabled(False)
+        
+        # Starte den Crawl-Thread für diesen Spider
+        # Das `scheduled=True` ist hier implizit durch `is_scheduled_crawl_active`
+        self._start_crawl(spider_name) # Verwende die interne Startmethode
+
+    @pyqtSlot(str)
+    def show_scheduled_crawl_feedback(self, message):
+        """Zeigt eine kurze Info-Nachricht zum Scheduler-Status an."""
+        # Optional: Zeige dies in der Statusleiste oder als kleine Popup-Nachricht
+        # Korrigierter Aufruf
+        # self.statusBar().showMessage(message, 5000) # 5 Sekunden anzeigen
+        self.statusBar.showMessage(message, 5000) # Korrekt: ohne () nach statusBar
+        logger.info(message) # Auch im Log ausgeben
+    # --- Ende Scheduler-Methoden ---
+
+    # --- NEUER Slot zum Stoppen der TTS --- 
+    @pyqtSlot()
+    def on_stop_tts_clicked(self):
+        """Wird aufgerufen, wenn der Stop-TTS-Button geklickt wird."""
+        if hasattr(self, 'tts_manager') and self.tts_manager and hasattr(self.tts_manager, 'stop_playback'):
+            logger.info("Stop TTS Button geklickt. Versuche Wiedergabe zu stoppen...")
+            try:
+                self.tts_manager.stop_playback()
+            except Exception as e:
+                logger.error(f"Fehler beim Aufrufen von tts_manager.stop_playback(): {e}", exc_info=True)
+        else:
+            logger.warning("Stop TTS Button geklickt, aber kein gültiger TTS-Manager oder keine stop_playback Methode gefunden.")
+    # --- Ende Neuer Slot --- 
+
+    # ---> Trigger-Methode für den neuen Button
+    def trigger_all_spiders_sequentially(self):
+        """Startet den Thread zum sequenziellen Ausführen aller Spider."""
+        if self.all_spiders_thread and self.all_spiders_thread.isRunning():
+            QMessageBox.warning(self, "Prozess läuft bereits", "Es läuft bereits ein Prozess zum Starten aller Spider.")
+            return
+
+        # Prüfe auch, ob ein normaler Crawl oder ein Scheduler aktiv ist
+        if (self.crawler_thread and self.crawler_thread.isRunning()) or self.is_scheduled_crawl_active:
+            QMessageBox.warning(self, "Anderer Prozess aktiv", "Ein einzelner Crawl oder der Scheduler ist bereits aktiv.")
+            return
+
+        logger.info("Starte Thread zum sequenziellen Ausführen aller Spider...")
+        self.statusBar.showMessage("Starte Prozess: Alle Spider nacheinander...", 3000)
+        self.set_crawl_buttons_enabled(False) # Alle Crawl-Buttons deaktivieren
+        self.crawler_main_status_label.setText("Status: Starting All...")
+        self.crawler_activity_label.setText("Finding spiders...")
+
+        self.all_spiders_thread = AllSpidersRunThread(project_root="D:\\_____RH-IT\\JARVIS") # Pfad anpassen bei Bedarf
+
+        # Signale des Threads verbinden
+        self.all_spiders_thread.spider_starting.connect(self.on_all_spiders_starting)
+        self.all_spiders_thread.spider_finished.connect(self.on_all_spiders_finished_one)
+        self.all_spiders_thread.all_spiders_finished.connect(self.on_all_spiders_sequence_finished)
+        self.all_spiders_thread.error_occurred.connect(self.on_all_spiders_error)
+        # Aufräumen, wenn der Thread beendet ist (wichtig!)
+        self.all_spiders_thread.finished.connect(self.on_all_spiders_thread_actually_finished)
+
+        self.all_spiders_thread.start()
+    # <--- Ende Trigger-Methode
+
+    # ---> Slots für den AllSpidersRunThread
+    @pyqtSlot(str)
+    def on_all_spiders_starting(self, spider_name):
+        """Aktualisiert die UI, wenn der nächste Spider gestartet wird."""
+        self.crawler_main_status_label.setText(f"Status: Running All...")
+        self.crawler_activity_label.setText(f"Running: {spider_name}")
+        logger.info(f"[All Spiders] Starting: {spider_name}")
+
+    @pyqtSlot(str, int)
+    def on_all_spiders_finished_one(self, spider_name, exit_code):
+        """Wird aufgerufen, wenn ein einzelner Spider beendet wurde."""
+        if exit_code == 0:
+            logger.info(f"[All Spiders] Finished successfully: {spider_name}")
+            self.crawler_activity_label.setText(f"Finished: {spider_name}, starting next...")
+        else:
+            logger.error(f"[All Spiders] Failed: {spider_name} with exit code {exit_code}")
+            self.crawler_activity_label.setText(f"Failed: {spider_name} (Code: {exit_code})")
+            # Optional: Hier könnte man die Sequenz abbrechen
+
+    @pyqtSlot()
+    def on_all_spiders_sequence_finished(self):
+        """Wird aufgerufen, wenn alle Spider erfolgreich durchgelaufen sind."""
+        logger.info("[All Spiders] Sequence finished successfully.")
+        self.statusBar.showMessage("Alle Spider erfolgreich ausgeführt.", 5000)
+        self.crawler_main_status_label.setText("Status: Idle")
+        self.crawler_activity_label.setText("All spiders finished.")
+        # Buttons wieder aktivieren, wenn der Thread tatsächlich beendet ist (siehe on_all_spiders_thread_actually_finished)
+
+    @pyqtSlot(str)
+    def on_all_spiders_error(self, error_message):
+        """Wird aufgerufen, wenn im AllSpidersRunThread ein Fehler auftritt."""
+        logger.error(f"[All Spiders] Error during sequence: {error_message}")
+        QMessageBox.critical(self, "Fehler beim Ausführen aller Spider", error_message)
+        self.crawler_main_status_label.setText("Status: Error (All Spiders)")
+        self.crawler_activity_label.setText(f"Error: {error_message[:100]}...")
+        # Buttons wieder aktivieren, wenn der Thread tatsächlich beendet ist (siehe on_all_spiders_thread_actually_finished)
+
+    @pyqtSlot()
+    def on_all_spiders_thread_actually_finished(self):
+        """Slot der aufgerufen wird, wenn der QThread selbst beendet ist (nach run())."""
+        logger.debug("AllSpidersRunThread tatsächlich beendet. Aktiviere Buttons.")
+        self.set_crawl_buttons_enabled(True) # Buttons hier sicher wieder aktivieren
+        self.all_spiders_thread = None # Referenz löschen
+    # <--- Ende Slots für AllSpidersRunThread
+
+    # --- Placeholder für neue Aktions-Buttons ---
+    def on_create_image_clicked(self):
+        logger.info("Button 'Bild erstellen' geklickt (Funktion noch nicht implementiert).")
+        QMessageBox.information(self, "Info", "Funktion 'Bild erstellen' ist noch nicht implementiert.")
+
+    def on_create_video_clicked(self):
+        logger.info("Button 'Video erstellen' geklickt (Funktion noch nicht implementiert).")
+        QMessageBox.information(self, "Info", "Funktion 'Video erstellen' ist noch nicht implementiert.")
+
+    def on_voice_agent_clicked(self): # Geändert
+        logger.info("Button 'Voice Agent' geklickt (Funktion noch nicht implementiert).")
+        QMessageBox.information(self, "Info", "Funktion 'Voice Agent' ist noch nicht implementiert.")
+    # --- Ende Placeholder ---
+
+@crochet.wait_for(timeout=None) # Erlaubt das Starten von Twisted-Prozessen im Thread
+def run_spider_in_thread(process, spider_name, **kwargs):
+    """ Hilfsfunktion, um den CrawlerProcess im Crochet-Kontext zu starten """
+    # Diese Funktion startet den Crawl und gibt ein Deferred zurück.
+    # crochet.wait_for kümmert sich darum, dass der Thread wartet,
+    # bis das Deferred abgeschlossen ist, ohne die GUI zu blockieren.
+    # Übergibt zusätzliche kwargs an process.crawl
+    return process.crawl(spider_name, **kwargs)
+
+# === Neue Klasse für ScrapyCrawlerThread ===
+class ScrapyCrawlerThread(QThread):
+    # Signale für die Kommunikation mit dem Hauptthread (BLEIBEN GLEICH)
+    crawl_started = pyqtSignal()
+    status_update = pyqtSignal(str)
+    item_processed = pyqtSignal(str) # Sendet z.B. die URL des verarbeiteten Items
+    crawl_finished = pyqtSignal(str, str) # spider_name, reason
+    crawl_error = pyqtSignal(str, str) # spider_name, error_message
+
+    def __init__(self, spider_name, learning_manager, config, parent=None):
+        super().__init__(parent)
+        self.spider_name = spider_name
+        self.learning_manager = learning_manager
+        self.config = config
+        # self.pipeline_instance = None # Nicht mehr benötigt?
+        self.result_queue = queue.Queue() # *** NEUE Queue erstellen ***
+        logger.info(f"ScrapyCrawlerThread für Spider '{self.spider_name}' initialisiert (mit Queue).")
+
+    def run(self):
+        spider_finished = False # Flag um die Queue-Schleife zu beenden
+        try:
+            self.crawl_started.emit()
+            self.status_update.emit(f"Initialisiere Scrapy Settings für {self.spider_name}...")
+            logger.info(f"Initialisiere Scrapy Settings für CrawlerThread ({self.spider_name})...")
+
+            settings_obj = Settings()
+            settings_obj['ITEM_PIPELINES'] = {
+                'src.scraping.knowledge_crawler.pipelines.LearningManagerPipeline': 1,
+            }
+            settings_obj['LOG_LEVEL'] = 'INFO'
+            settings_obj['SPIDER_MODULES'] = ['src.scraping.knowledge_crawler.spiders']
+            # Optional: Eigene User-Agent Einstellung, falls blockiert wird
+            # settings_obj['USER_AGENT'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+
+            self.status_update.emit("Erstelle CrawlerProcess...")
+            logger.info("Erstelle CrawlerProcess...")
+            process = CrawlerProcess(settings_obj)
+
+            self.status_update.emit(f"Starte {self.spider_name} Spider...")
+            logger.info(f"Starte {self.spider_name} über CrawlerProcess und übergebe LearningManager und Thread-Instanz...")
+
+            # Starte den spezifischen Spider im Crochet-Kontext
+            run_spider_in_thread(process, self.spider_name,
+                               learning_manager=self.learning_manager,
+                               thread_instance=self)
+
+            logger.info(f"Scrapy-Prozess für {self.spider_name} (via crochet) beendet.")
+
+        except Exception as e:
+            error_msg = f"Fehler im ScrapyCrawlerThread run ({self.spider_name}): {e}"
+            logger.error(error_msg, exc_info=True)
+            self.crawl_error.emit(self.spider_name, error_msg)
+        finally:
+            logger.info(f"ScrapyCrawlerThread run-Methode für {self.spider_name} beendet.")
+
+    # --- Implementierte Signal Handler ---
+    # Diese Methoden werden von Scrapy-Signalen aufgerufen (im Twisted Reactor Thread)
+    # Sie müssen sicherstellen, dass GUI-Updates über Signale an den Hauptthread gesendet werden.
+
+    def _item_scraped_handler(self, item, response, spider):
+        # Wird für jedes gecrawlte Item aufgerufen
+        adapter = ItemAdapter(item)
+        url = adapter.get('url', 'Unbekannte URL') # Hole URL vom Item
+        # Sende Signal an Hauptthread
+        self.item_processed.emit(url) # Direktes Emit sollte Thread-sicher sein für Qt Signale
+        logger.debug(f"Item scraped: {url}")
+
+    def _spider_closed_handler(self, spider, reason):
+        # Wird aufgerufen, wenn der Spider schließt
+        # Sende spider_name mit
+        logger.debug(f"Thread {self.objectName()}: Spider '{spider.name}' geschlossen. Sende crawl_finished Signal...") # NEUES DEBUG LOGGING
+        self.crawl_finished.emit(spider.name, reason)
+        logger.info(f"Spider geschlossen: {spider.name}, Grund: {reason}")
+
+    def _spider_error_handler(self, failure, response, spider):
+        # Wird bei Fehlern während des Crawlens aufgerufen
+        error_msg = f"Spider Error in {spider.name}: {failure.getErrorMessage()}"
+        logger.error(error_msg, exc_info=failure.value) # Logge den Traceback
+        # Sende auch den spider_name mit
+        self.crawl_error.emit(spider.name, error_msg)
+
+# --- Ende ScrapyCrawlerThread ---
+
+# === Klasse für den Audiobook-Import (aus Backup wiederhergestellt) ===
+def find_and_process_audio_in_folder(file_path: str, learning_manager, whisper_recognizer) -> bool:
+    """
+    Verarbeitet eine einzelne Audiodatei und fügt sie zur Wissensbasis hinzu.
+
+    Args:
+        file_path: Pfad zur Audiodatei
+        learning_manager: Instance des LearningManager
+        whisper_recognizer: Instance des WhisperRecognizer
+
+    Returns:
+        bool: True wenn erfolgreich, False wenn ein Fehler auftrat
+    """
+    try:
+        # Transkribiere die Audio-Datei
+        transcript = whisper_recognizer.transcribe_wav(file_path)
+
+        if not transcript:
+            logger.warning(f"Keine Transkription für: {file_path}")
+            return False
+
+        # Speichere das Transkript in der Wissensbasis
+        learning_manager.add_entry(
+            doc_id=str(uuid.uuid4()),
+            content=transcript,
+            metadata={
+                "entry_type": "audiobook_chunk",
+                "source": os.path.basename(file_path),
+                "timestamp": datetime.now().isoformat()
+            }
+        )
+
+        return True
+
+    except Exception as e:
+        logger.error(f"Fehler bei der Verarbeitung von {file_path}: {e}")
+        return False
+
+class AudiobookImportThread(QThread):
+    """Thread für den Import von Audiobüchern."""
+    # VERWENDE NEUE SIGNALNAMEN (wie in import_audiobooks verbunden)
+    progress_update = pyqtSignal(int, int, str) # (current, total, message)
+    finished = pyqtSignal() # Signal ohne Argumente für Erfolg
+    error = pyqtSignal(str) # Signal für Fehlermeldung
+
+    def __init__(self, folder_path: str, whisper_recognizer: WhisperRecognizer, learning_manager: LearningManager, parent=None):
+        super().__init__(parent)
+        self.folder_path = folder_path
+        self.whisper_recognizer = whisper_recognizer
+        self.learning_manager = learning_manager
+        self.log_prefix = "[AudiobookImportThread]"
+        self._is_stopped = False # Flag zum Stoppen
+        self.processed_log_file = os.path.join("data", "temp", "audiobook_processing", "processed_files.log")
+        # ---> Sicherstellen, dass das Log-Verzeichnis existiert
+        try:
+            os.makedirs(os.path.dirname(self.processed_log_file), exist_ok=True)
+        except Exception as e:
+            logger.error(f"{self.log_prefix} Konnte Log-Verzeichnis nicht erstellen: {e}")
+            # Optional: Thread hier beenden oder weitermachen und hoffen?
+
+    def stop(self):
+        """Setzt das Stop-Flag."""
+        self._is_stopped = True
+        logger.info(f"{self.log_prefix} Stop-Anforderung erhalten.")
+
+    def run(self):
+        """Führt den Import-Prozess aus und hängt jede erfolgreiche Datei an die Logdatei an."""
+        success_count = 0
+        total_files_to_process = 0
+        processed_files = 0
+        # last_successful_file wird nicht mehr benötigt
+        try:
+            logger.info(f"{self.log_prefix} Starte Import von Audiobüchern aus: {self.folder_path}")
+            # Zuerst alle relevanten Dateien zählen
+            audio_files = []
+            for root, _, files in os.walk(self.folder_path):
+                for file in files:
+                    if self._is_stopped:
+                        logger.info(f"{self.log_prefix} Import während Dateisuche abgebrochen.")
+                        self.error.emit("Import abgebrochen")
+                        return
+                    if file.lower().endswith(('.mp3', '.wav', '.m4a', '.flac')):
+                        audio_files.append(os.path.join(root, file))
+            total_files_to_process = len(audio_files)
+            logger.info(f"{self.log_prefix} {total_files_to_process} Audiodateien gefunden.")
+
+            if not self.whisper_recognizer:
+                error_msg = "Whisper Recognizer ist nicht initialisiert."
+                logger.error(f"{self.log_prefix} {error_msg}")
+                self.error.emit(error_msg)
+                return
+
+            # Verarbeite die gefundenen Dateien
+            for file_path in audio_files:
+                if self._is_stopped:
+                    logger.info(f"{self.log_prefix} Import während Verarbeitung abgebrochen.")
+                    break # Verlasse die Schleife
+                processed_files += 1
+                try:
+                    file_name = os.path.basename(file_path)
+                    status_msg = f"Verarbeite ({processed_files}/{total_files_to_process}): {file_name}..."
+                    self.progress_update.emit(processed_files, total_files_to_process, status_msg)
+                    logger.debug(f"{self.log_prefix} {status_msg}")
+
+                    success = find_and_process_audio_in_folder(
+                        file_path,
+                        self.learning_manager,
+                        self.whisper_recognizer
+                    )
+
+                    if success:
+                        success_count += 1
+                        logger.info(f"{self.log_prefix} Erfolgreich importiert: {file_name}")
+                        # ---> Logge die erfolgreiche Datei sofort im Append-Modus
+                        try:
+                            with open(self.processed_log_file, 'a', encoding='utf-8') as f:
+                                f.write(file_path + '\n') # Schreibe Pfad und Zeilenumbruch
+                            # Optional: Loggen, dass geschrieben wurde (kann viel werden)
+                            # logger.debug(f"{self.log_prefix} '{file_path}' an Logdatei angehängt.")
+                        except Exception as log_e:
+                            logger.error(f"{self.log_prefix} Fehler beim Anhängen an Logdatei '{self.processed_log_file}': {log_e}")
+                        # <--- Ende Loggen
+                    else:
+                        logger.warning(f"{self.log_prefix} Fehler beim Import von: {file_name}")
+
+                except Exception as e:
+                    logger.error(f"{self.log_prefix} Fehler bei der Verarbeitung von {file_name}: {e}", exc_info=True)
+                    self.progress_update.emit(processed_files, total_files_to_process, f"Fehler bei {file_name}")
+
+            logger.info(f"{self.log_prefix} Import-Schleife beendet. {success_count} von {processed_files} verarbeiteten Dateien erfolgreich.")
+            # ---> Kein separates Loggen mehr am Ende nötig
+            self.finished.emit() # Erfolgssignal
+
+        except Exception as e:
+            error_msg = f"Schwerwiegender Fehler im Import-Prozess: {e}"
+            logger.error(f"{self.log_prefix} {error_msg}", exc_info=True)
+            # ---> Kein separates Loggen mehr am Ende nötig
+            self.error.emit(error_msg)
+
+# === Ende AudiobookImportThread ===
+
+# === HIER die TextProcessingThread Klasse aus dem Backup einfügen ===
 class TextProcessingThread(QThread):
-    """Thread für die Textverarbeitung"""
-    update_chat = pyqtSignal(str, str)  # sender, message
-    trigger_tts = pyqtSignal(str)  # text
-    processing_finished = pyqtSignal(str, str)  # response_id, result
-    
-    def __init__(self, text, llm_manager, config, learning_manager, river_learning_manager, response_id, parent=None):
+    """Thread für die Verarbeitung von Texteingaben."""
+    # Passe die Signale an die aktuellen Slots in MainWindow an, falls nötig
+    # Annahme: update_chat sendet nur sender und message
+    update_chat = pyqtSignal(str, str)
+    trigger_tts = pyqtSignal(str)
+    # Passe das Signal an, um response_id und result zurückzugeben (wie in on_processing_finished erwartet)
+    processing_finished = pyqtSignal(str, str) # response_id, result
+    processing_error = pyqtSignal(str) # Fehlermeldung
+
+    def __init__(self, text: str, llm_manager, config, learning_manager, river_learning_manager, response_id: str, parent=None):
         super().__init__(parent)
         self.text = text
         self.llm_manager = llm_manager
@@ -1175,406 +2097,174 @@ class TextProcessingThread(QThread):
         self.learning_manager = learning_manager
         self.river_learning_manager = river_learning_manager
         self.response_id = response_id
-        
+        self.log_prefix = "[TextProcessingThread]"
+
     def run(self):
+        """Verarbeitet die Texteingabe und erhält eine Antwort vom LLM."""
         try:
-            # Verarbeite Text mit LLM
-            response = self.llm_manager.process_text(self.text)
-            
-            # Speichere Interaktion (Korrigierter Methodenname)
-            if hasattr(self.learning_manager, 'add_interaction'):
-                self.learning_manager.add_interaction(
-                    self.text, 
-                    response,
-                    # Passe den Kontext an, falls die Methode ihn erwartet
-                    # Ggf. nur response_id oder ein leeres Dict übergeben?
-                    # Hängt von der Definition von add_interaction ab.
-                    # Aktuell: Übergebe response_id als Teil eines dicts
-                    context={"response_id": self.response_id} 
-                )
-            else:
-                logger.warning("LearningManager hat keine Methode 'add_interaction'. Interaktion kann nicht gespeichert werden.")
-            
-            # Aktualisiere River Learning
+            logger.info(f"{self.log_prefix} Verarbeite Text: '{self.text}'")
+
+            # --- Schritt 0.5: Predict intent with River (falls vorhanden) --- 
             if self.river_learning_manager:
-                # Versuche, das Modell mit der neuen Interaktion zu aktualisieren
                 try:
-                    self.river_learning_manager.learn(self.text, response)
-                    logger.info("River-Modell erfolgreich aktualisiert.")
-                except Exception as e:
-                    logger.error(f"Fehler beim Aktualisieren des River-Modells: {e}")
-            
-            # Sende Ergebnis
-            self.update_chat.emit("JARVIS", response)
-            self.processing_finished.emit(self.response_id, response)
-            
-            # Trigger TTS wenn aktiviert
-            if self.config.get("use_tts", False):
-                self.trigger_tts.emit(response)
-            
-        except Exception as e:
-            error_msg = f"Fehler bei der Textverarbeitung: {str(e)}"
-            logger.error(error_msg)
-            self.update_chat.emit("System", error_msg)
-
-class AudioRecordingThread(QThread):
-    """Thread für kontinuierliche Audioaufnahme"""
-    audio_data_ready = pyqtSignal(object)  # Sendet numpy array
-    error = pyqtSignal(str)
-    
-    def __init__(self, device_index, sample_rate, chunk_size, parent=None):
-        super().__init__(parent)
-        self.device_index = device_index
-        self.sample_rate = sample_rate
-        self.chunk_size = chunk_size
-        self.running = False
-        # === DEBUGGING: Logge Initialisierungsparameter ===
-        logger.debug(f"AudioRecordingThread initialisiert mit device_index={self.device_index}, sample_rate={self.sample_rate}, chunk_size={self.chunk_size}")
-        
-    def run(self):
-        # === DEBUGGING: Logge Thread-Start ===
-        logger.info(f"AudioRecordingThread gestartet (ID: {self.currentThreadId()})")
-        try:
-            import sounddevice as sd
-            logger.debug("Sounddevice-Modul erfolgreich importiert.")
-            
-            self.running = True
-            # === DEBUGGING: Logge vor dem Öffnen des Streams ===
-            logger.info(f"Versuche, InputStream zu öffnen: device={self.device_index}, samplerate={self.sample_rate}, channels=1")
-            
-            with sd.InputStream(device=self.device_index,
-                              samplerate=self.sample_rate,
-                              channels=1,
-                              dtype=np.float32,
-                              blocksize=self.chunk_size) as stream:
-                
-                # === DEBUGGING: Logge erfolgreiches Öffnen des Streams ===
-                logger.info("InputStream erfolgreich geöffnet.")
-                
-                # Buffer für die gesamte Aufnahme
-                buffer = []
-                
-                while self.running:
-                    # === DEBUGGING: Logge vor stream.read() ===
-                    # logger.debug("Warte auf Audiodaten von stream.read()...") # Deaktiviert, da es zu viel loggt
-                    audio_chunk, overflowed = stream.read(self.chunk_size)
-                    # === DEBUGGING: Logge nach stream.read() ===
-                    if overflowed:
-                        logger.warning("Input overflowed!")
-                    # logger.debug(f"Audio-Chunk gelesen, Größe: {audio_chunk.shape}") # Deaktiviert, da es zu viel loggt
-                    
-                    buffer.append(audio_chunk.copy())
-                    
-                    # Entferne die Puffer-Prüfung und das Senden hier
-                    # buffer_duration = len(buffer) * self.chunk_size / self.sample_rate
-                    # logger.debug(f"Aktueller Puffer: {len(buffer)} Chunks, Berechnete Dauer: {buffer_duration:.4f}s")
-                    # if len(buffer) >= 32: # Geändert von 79 -> ENTFERNT
-                    #     ... Sende Logik entfernt ...
-                    #     buffer = [] # Leere den Buffer -> ENTFERNT
-                
-                # === Nach der Schleife: Sende die gesamte Aufnahme ===
-                if buffer: # Prüfe, ob überhaupt etwas aufgenommen wurde
-                    audio_data = np.concatenate(buffer)
-                    buffer_duration = len(audio_data) / self.sample_rate
-                    logger.info(f"Aufnahme gestoppt. Sende gesamte Audioaufnahme ({buffer_duration:.2f}s, Datenform: {audio_data.shape})")
-                    self.audio_data_ready.emit(audio_data)
-                else:
-                    logger.info("Aufnahme gestoppt, aber kein Audio im Puffer.")
-                        
-        except sd.PortAudioError as pae:
-             logger.error(f"PortAudio Fehler im Aufnahme-Thread: {pae}", exc_info=True)
-        except Exception as e:
-            # === DEBUGGING: Logge unerwarteten Fehler detaillierter ===
-            logger.error(f"Unerwarteter Fehler im Aufnahme-Thread: {e}", exc_info=True)
-            self.error.emit(str(e))
-        finally:
-            # === DEBUGGING: Logge Thread-Ende ===
-            logger.info(f"AudioRecordingThread beendet (ID: {self.currentThreadId()}). Running-Status: {self.running}")
-            
-    def stop(self):
-        """Stoppt die Aufnahme"""
-        # === DEBUGGING: Logge Stopp-Anforderung ===
-        logger.info(f"AudioRecordingThread stop() aufgerufen (ID: {self.currentThreadId()})")
-        self.running = False
-
-# === Neue Klasse für Audiobuch-Verarbeitung ===
-class AudioProcessingThread(QThread):
-    """Thread zur Verarbeitung von Audiodateien (z.B. Hörbücher) im Hintergrund."""
-    finished = pyqtSignal()
-    error = pyqtSignal(str)
-    progress_update = pyqtSignal(int, int, str) # current, total, message
-
-    def __init__(self, folder_path, chunk_size, learning_manager, whisper_recognizer, parent=None):
-        super().__init__(parent)
-        self.folder_path = folder_path
-        self.chunk_size_seconds = chunk_size
-        self.learning_manager = learning_manager
-        self.whisper_recognizer = whisper_recognizer
-        self.running = True
-        self.sample_rate = 16000 # Whisper benötigt 16kHz
-        
-    def run(self):
-        try:
-            # === Finde ffmpeg.exe Pfad ===
-            # Versuche zuerst einen bekannten Pfad, dann den System-PATH
-            ffmpeg_path = "C:\\ffmpeg\\bin\\ffmpeg.exe" # Annahme basierend auf früheren Logs
-            if not os.path.exists(ffmpeg_path):
-                 # Versuche, ffmpeg im PATH zu finden (Windows)
-                 try:
-                      where_output = subprocess.check_output(["where", "ffmpeg"], text=True, startupinfo=subprocess.STARTUPINFO(dwFlags=subprocess.CREATE_NO_WINDOW | subprocess.STARTF_USESHOWWINDOW))
-                      ffmpeg_path = where_output.strip().split('\n')[0] # Nimm den ersten Treffer
-                      logger.info(f"FFmpeg im PATH gefunden: {ffmpeg_path}")
-                 except (subprocess.CalledProcessError, FileNotFoundError):
-                      logger.error("ffmpeg.exe konnte weder am Standardort noch im PATH gefunden werden! Konvertierung nicht möglich.")
-                      self.error.emit("ffmpeg nicht gefunden")
-                      return # Thread beenden
+                    intent_prediction = self.river_learning_manager.predict(self.text)
+                    logger.info(f"{self.log_prefix} River Intent Prediction: '{intent_prediction}' for '{self.text}'")
+                    # TODO: Kontext speichern? (interaction_context ist in MainWindow)
+                except Exception as river_e:
+                    logger.warning(f"{self.log_prefix} River prediction failed: {river_e}")
             else:
-                 logger.info(f"Verwende ffmpeg von: {ffmpeg_path}")
+                logger.debug(f"{self.log_prefix} RiverLearningManager not available for prediction.") # Debug statt Warning
 
-            logger.info(f"Starte Audiobuch-Verarbeitung für Ordner: {self.folder_path}")
-            
-            # === Dateisuche bleibt gleich ===
-            audio_files = []
-            supported_extensions = {".wav", ".mp3", ".flac", ".m4a"} 
-            for root, dirs, files in os.walk(self.folder_path):
-                for filename in files:
-                    _, ext = os.path.splitext(filename)
-                    if ext.lower() in supported_extensions:
-                        filepath = os.path.join(root, filename)
-                        audio_files.append(filepath)
-                        logger.debug(f"Gefunden: {filepath}")
+            # --- Schritt 1: Sende Text direkt an LLM --- 
+            if not self.llm_manager:
+                raise RuntimeError("LLM Manager ist nicht initialisiert")
 
-            if not audio_files:
-                logger.warning(f"Keine unterstützten Audiodateien ({supported_extensions}) in {self.folder_path} mit os.walk gefunden.")
-                self.error.emit(f"Keine Audiodateien gefunden in {self.folder_path}")
+            logger.info(f"{self.log_prefix} Rufe llm_manager.process_text auf...")
+            llm_response = self.llm_manager.process_text(self.text)
+
+            if not llm_response:
+                # raise RuntimeError("LLM hat keine Antwort zurückgegeben") # Alt: Absturz
+                # Neu: Fehlermeldung an GUI senden
+                error_msg = "Das KI-Modell hat leider keine Antwort generiert."
+                logger.warning(f"{self.log_prefix} {error_msg}")
+                self.update_chat.emit("System", f"[Fehler: {error_msg}]")
+                self.processing_finished.emit(self.response_id, "") # Signalisiere Ende ohne gültige Antwort
+                return # Beende den Thread hier
+
+            logger.info(f"{self.log_prefix} LLM Antwort erhalten: '{llm_response[:100]}...'")
+
+            # Speichere die Konversation in der Wissensbasis (falls vorhanden)
+            if self.learning_manager:
+                try:
+                    metadata = {
+                        "entry_type": "conversation",
+                        "timestamp": datetime.now().isoformat(),
+                        "input": self.text,
+                        "response": llm_response
+                    }
+                    self.learning_manager.add_entry(
+                        doc_id=str(uuid.uuid4()), # Verwende uuid hier
+                        content=f"Frage: {self.text}\nAntwort: {llm_response}",
+                        metadata=metadata
+                    )
+                    logger.info(f"{self.log_prefix} Konversation in Wissensbasis gespeichert")
+                except Exception as e:
+                    logger.error(f"{self.log_prefix} Fehler beim Speichern der Konversation: {str(e)}")
+
+            # Sende LLM Antwort an GUI
+            self.update_chat.emit("JARVIS", llm_response)
+
+            # Trigger TTS wenn aktiviert
+            try:
+                # Prüfe die Konfiguration direkt über self.config
+                if self.config and self.config.get("use_tts", False):
+                    self.trigger_tts.emit(llm_response)
+                    logger.debug(f"{self.log_prefix} TTS Signal gesendet für Antwort.")
+                else:
+                    logger.debug(f"{self.log_prefix} TTS ist deaktiviert oder Config fehlt.")
+            except Exception as e:
+                logger.error(f"{self.log_prefix} Fehler beim Prüfen der TTS-Konfiguration oder Senden des Signals: {e}", exc_info=True)
+
+            # Sende das Ergebnis zurück an MainWindow
+            self.processing_finished.emit(self.response_id, llm_response)
+
+        except Exception as e:
+            error_msg = f"{self.log_prefix} Fehler in der Verarbeitung: {str(e)}"
+            logger.error(error_msg, exc_info=True) # Logge Traceback
+            # Sende Fehler an GUI
+            self.processing_error.emit(error_msg)
+            # Signalisiere auch das Ende (mit Fehlermarker)
+            self.processing_finished.emit(self.response_id, f"FEHLER: {e}") # Sende Fehler auch hier
+
+# === Ende TextProcessingThread ===
+
+# === NEUE Klasse AllSpidersRunThread HIER definieren (am Ende der Datei) ===
+class AllSpidersRunThread(QThread):
+    """Thread zum sequenziellen Ausführen aller Scrapy Spiders."""
+    spider_starting = pyqtSignal(str) # spider_name
+    spider_finished = pyqtSignal(str, int) # spider_name, exit_code
+    all_spiders_finished = pyqtSignal()
+    error_occurred = pyqtSignal(str) # error_message
+
+    def __init__(self, project_root, parent=None):
+        super().__init__(parent)
+        self.project_root = project_root
+        self.log_prefix = "[AllSpidersRunThread]"
+        self._is_stopped = False # Für zukünftige Abbruch-Funktionalität
+
+    def stop(self):
+        self._is_stopped = True
+        logger.info(f"{self.log_prefix} Stop request received (not fully implemented for subprocesses yet).")
+
+    def run(self):
+        """Führt 'scrapy list' aus und dann 'scrapy crawl' für jeden Spider."""
+        spider_names = []
+        crawl_cmd = [] # Für Fehlermeldung
+        try:
+            scraping_dir = os.path.join(self.project_root, "src", "scraping")
+            venv_python = os.path.join(self.project_root, "venv", "Scripts", "python.exe")
+
+            if not os.path.exists(venv_python):
+                # Versuch, den globalen Python-Interpreter zu verwenden, falls kein venv da ist
+                # Dies ist riskant, wenn Abhängigkeiten nicht global installiert sind.
+                logger.warning(f"{self.log_prefix} Venv Python not found at {venv_python}. Trying system Python.")
+                venv_python = sys.executable # Verwende den Interpreter, der dieses Skript ausführt
+
+            if not os.path.isdir(scraping_dir):
+                 raise FileNotFoundError(f"Scraping directory not found: {scraping_dir}")
+
+            # 1. Scrapy list
+            logger.info(f"{self.log_prefix} Finding spiders in {scraping_dir} using {venv_python}...")
+            list_cmd = [venv_python, "-m", "scrapy", "list"]
+            result = subprocess.run(list_cmd, cwd=scraping_dir, capture_output=True, text=True, check=True, shell=False)
+            spider_names = [name.strip() for name in result.stdout.splitlines() if name.strip()]
+            logger.info(f"{self.log_prefix} Found spiders: {spider_names}")
+
+            if not spider_names:
+                logger.warning(f"{self.log_prefix} No spiders found.")
+                self.error_occurred.emit("Keine Spider gefunden.")
                 return
 
-            total_files = len(audio_files)
-            logger.info(f"Gefunden: {total_files} Audiodateien.")
+            # 2. Scrapy crawl für jeden Spider
+            for spider_name in spider_names:
+                if self._is_stopped:
+                    logger.info(f"{self.log_prefix} Stopping sequence before running {spider_name}.")
+                    self.error_occurred.emit("Prozess abgebrochen.")
+                    return
 
-            for idx, original_filepath in enumerate(audio_files):
-                if not self.running: break
+                self.spider_starting.emit(spider_name)
+                crawl_cmd = [venv_python, "-m", "scrapy", "crawl", spider_name]
+                logger.info(f"{self.log_prefix} Running command: {' '.join(crawl_cmd)}")
 
-                temp_wav_file = None # Reset
-                processing_filepath = original_filepath # Pfad zur Datei, die verarbeitet wird
-                try:
-                    current_file_num = idx + 1
-                    filename = os.path.basename(original_filepath)
-                    
-                    # ---> CALLBACK-AUFRUF ERSETZT DURCH SIGNAL
-                    self.progress_update.emit(current_file_num, total_files, f"Verarbeite {filename} ({current_file_num}/{total_files})")
-                    # Kurze Pause, um der GUI Zeit zum Aktualisieren zu geben (optional, aber kann helfen)
-                    QThread.msleep(10) 
-                    # <--- Ende ÄNDERUNG
+                # Verwende run, um auf die Beendigung zu warten
+                process_result = subprocess.run(crawl_cmd, cwd=scraping_dir, capture_output=True, text=True, shell=False)
+                exit_code = process_result.returncode
 
-                    # === Konvertiere zu WAV mit subprocess ===
-                    if not original_filepath.lower().endswith('.wav'):
-                        logger.info(f"Konvertiere {original_filepath} zu WAV mit ffmpeg...")
-                        temp_wav_file = os.path.join(
-                            tempfile.gettempdir(), # Temporäres Verzeichnis verwenden
-                            f"jarvis_temp_{uuid.uuid4()}.wav"
-                        )
-                        
-                        # ffmpeg Kommando
-                        # -i: Input, -vn: Video deaktivieren, -acodec pcm_s16le: WAV Codec,
-                        # -ar 16000: Samplerate, -ac 1: Mono, -y: Überschreiben
-                        command = [
-                            ffmpeg_path,
-                            "-i", original_filepath,
-                            "-vn", "-acodec", "pcm_s16le",
-                            "-ar", str(self.sample_rate), "-ac", "1",
-                            "-y", # Überschreibe Zieldatei, falls vorhanden
-                            temp_wav_file
-                        ]
-                        
-                        logger.debug(f"Führe FFmpeg Kommando aus: {' '.join(command)}")
-                        logger.info(f"Starte subprocess.run für ffmpeg für Datei: {original_filepath}")
-                        startupinfo = None
-                        if os.name == 'nt': # Nur für Windows
-                            startupinfo = subprocess.STARTUPINFO()
-                            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                            startupinfo.wShowWindow = subprocess.SW_HIDE
-                            # CREATE_NO_WINDOW Flag, um Konsolenfenster zu verhindern
-                            creationflags = subprocess.CREATE_NO_WINDOW 
-                        else:
-                             creationflags = 0
-                        
-                        process = subprocess.run(
-                            command, 
-                            capture_output=True, # stdout/stderr abfangen
-                            text=True, 
-                            check=False, # Fehler manuell prüfen
-                            startupinfo=startupinfo,
-                            creationflags=creationflags
-                        )
-                        
-                        logger.info(f"subprocess.run für ffmpeg beendet. Return Code: {process.returncode}")
-                        
-                        if process.returncode != 0:
-                            logger.error(f"FFmpeg Konvertierung fehlgeschlagen für {original_filepath}. Return Code: {process.returncode}")
-                            logger.error(f"FFmpeg stderr: {process.stderr}")
-                            # Temporäre Datei versuchen zu löschen, falls erstellt
-                            if os.path.exists(temp_wav_file):
-                                try: os.remove(temp_wav_file)
-                                except Exception as del_e: logger.warning(f"Konnte fehlerhafte temp WAV nicht löschen: {del_e}")
-                            continue # Nächste Datei
-                        else:
-                            logger.info(f"Konvertierung nach {temp_wav_file} erfolgreich.")
-                            processing_filepath = temp_wav_file # Verarbeite die neue WAV
-                    
-                    # === Ende Konvertierung ===
+                if exit_code != 0:
+                    logger.error(f"{self.log_prefix} Spider {spider_name} failed with exit code {exit_code}.")
+                    logger.error(f"{self.log_prefix} Stdout:\n{process_result.stdout}")
+                    logger.error(f"{self.log_prefix} Stderr:\n{process_result.stderr}")
+                    # Optional: Hier abbrechen oder weitermachen? Aktuell: Weitermachen
+                else:
+                     logger.info(f"{self.log_prefix} Spider {spider_name} finished successfully.")
 
-                    # Verarbeite die WAV-Datei (Original oder temporär konvertiert)
-                    self.process_audio_file(processing_filepath)
-                    
-                except Exception as e:
-                    logger.error(f"Fehler bei der Verarbeitung der Datei {original_filepath}: {e}", exc_info=True)
-                    continue 
-                finally:
-                    # Aufräumen der temporären WAV-Datei (falls erstellt)
-                    if temp_wav_file and os.path.exists(temp_wav_file):
-                        try:
-                            os.remove(temp_wav_file)
-                            logger.info(f"Temporäre Konvertierungsdatei {temp_wav_file} gelöscht.")
-                        except Exception as e:
-                            logger.error(f"Fehler beim Löschen der temporären Konvertierungsdatei {temp_wav_file}: {e}")
-            
-            if self.running: self.finished.emit()
-            
+                self.spider_finished.emit(spider_name, exit_code)
+
+            # Wenn die Schleife durchläuft, sind alle fertig
+            self.all_spiders_finished.emit()
+
+        except FileNotFoundError as e:
+             error_msg = f"Fehler: Datei oder Verzeichnis nicht gefunden: {e}. Ist der Projektpfad korrekt und Scrapy im venv?"
+             logger.error(f"{self.log_prefix} {error_msg}")
+             self.error_occurred.emit(error_msg)
+        except subprocess.CalledProcessError as e:
+            command_str = ' '.join(e.cmd)
+            error_msg = f"Fehler beim Ausführen von Scrapy ({command_str}): {e.stderr or e.stdout or 'Keine Ausgabe'}"
+            logger.error(f"{self.log_prefix} {error_msg}", exc_info=True)
+            self.error_occurred.emit(error_msg)
         except Exception as e:
-            logger.error(f"Allgemeiner Fehler in der Audiobuch-Verarbeitung: {e}", exc_info=True)
-            self.error.emit(f"Allgemeiner Fehler: {str(e)}")
-            self.finished.emit() 
+            error_msg = f"Unerwarteter Fehler im AllSpidersRunThread: {e}"
+            logger.error(f"{self.log_prefix} {error_msg}", exc_info=True)
+            self.error_occurred.emit(error_msg)
 
-    def process_audio_file(self, filepath):
-        """Verarbeitet eine einzelne WAV-Audiodatei: Lädt, chunkt, transkribiert und speichert."""
-        logger.info(f"Beginne Verarbeitung von: {filepath}")
-        original_filename = os.path.basename(filepath) # Für Metadaten
-
-        try:
-            # 1. Lade Audiodatei mit librosa
-            # Verwende sr=None, um die ursprüngliche Sample-Rate zu erhalten, resample später falls nötig
-            logger.info(f"Starte librosa.load für Datei: {filepath}")
-            audio, sr = librosa.load(filepath, sr=None, mono=True) # Lade als Mono
-            logger.info(f"librosa.load abgeschlossen. SampleRate={sr}, Samples={len(audio)}")
-            logger.debug(f"Audiodatei geladen: Länge={len(audio)} Samples, SampleRate={sr} Hz")
-
-            # Resample zu 16kHz falls notwendig (Whisper erwartet 16kHz)
-            target_sr = 16000
-            if sr != target_sr:
-                logger.info(f"Resample von {sr}Hz zu {target_sr}Hz...")
-                audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
-                sr = target_sr # Update Sample Rate
-                logger.info("Resampling abgeschlossen.")
-
-            # Berechne Chunk-Größe in Samples
-            chunk_length_samples = self.chunk_size_seconds * sr
-            num_chunks = math.ceil(len(audio) / chunk_length_samples)
-            logger.info(f"Datei wird in {num_chunks} Chunks von ca. {self.chunk_size_seconds}s aufgeteilt.")
-
-            # 2. Iteriere durch Chunks
-            for i in range(num_chunks):
-                if not self.running: # Prüfe Abbruchbedingung
-                    logger.info("Audiobuch-Verarbeitung (in process_audio_file) durch Benutzer abgebrochen.")
-                    break 
-
-                start_sample = i * chunk_length_samples
-                end_sample = start_sample + chunk_length_samples
-                audio_chunk = audio[start_sample:end_sample]
-                
-                chunk_start_time_sec = start_sample / sr
-                chunk_end_time_sec = end_sample / sr
-
-                # ---> DEBUG-Log auskommentieren
-                # logger.debug(f"Verarbeite Chunk {i+1}/{num_chunks} (Samples {start_sample}-{end_sample}, Zeit {chunk_start_time_sec:.2f}s-{chunk_end_time_sec:.2f}s)")
-                # <--- Ende Änderung
-
-                # --- Workaround: Chunk temporär speichern für Whisper ---
-                # Erstelle eine temporäre WAV-Datei für den Chunk
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_chunk_file:
-                    temp_chunk_path = temp_chunk_file.name
-                    # Schreibe den Chunk in die temporäre Datei
-                    sf.write(temp_chunk_path, audio_chunk, sr) 
-                    # ---> DEBUG-Log auskommentieren
-                    # logger.debug(f"Chunk temporär gespeichert unter: {temp_chunk_path}")
-                    # <--- Ende Änderung
-
-                # 3. Transkribiere den Chunk
-                try:
-                    # Stelle sicher, dass whisper_recognizer initialisiert ist
-                    if not self.whisper_recognizer:
-                         logger.error("Whisper Recognizer ist nicht initialisiert!")
-                         # Optional: Hier abbrechen oder Fehler werfen
-                         os.remove(temp_chunk_path) # Temporäre Datei trotzdem löschen
-                         continue # Nächsten Chunk versuchen
-
-                    transcript = self.whisper_recognizer.transcribe_wav(temp_chunk_path)
-                    
-                    # Lösche die temporäre Chunk-Datei direkt nach der Transkription
-                    try:
-                        os.remove(temp_chunk_path)
-                        # ---> DEBUG-Log auskommentieren
-                        # logger.debug(f"Temporäre Chunk-Datei {temp_chunk_path} gelöscht.")
-                        # <--- Ende Änderung
-                    except Exception as del_e:
-                         logger.warning(f"Konnte temporäre Chunk-Datei {temp_chunk_path} nicht löschen: {del_e}")
-
-                    if transcript and transcript.strip():
-                        logger.info(f"Chunk {i+1} transkribiert: '{transcript[:80]}...'")
-                        
-                        # 4. Bereite Metadaten vor und speichere im LearningManager
-                        doc_id = f"audiobook_{original_filename}_chunk_{i+1}"
-                        metadata = {
-                            "entry_type": "audiobook_chunk",
-                            "source_file": original_filename,
-                            "chunk_index": i + 1,
-                            "total_chunks": num_chunks,
-                            "start_time_seconds": round(chunk_start_time_sec, 2),
-                            "end_time_seconds": round(chunk_end_time_sec, 2),
-                            "timestamp": datetime.now().isoformat()
-                        }
-                        
-                        # Stelle sicher, dass learning_manager initialisiert ist
-                        if not self.learning_manager:
-                             logger.error("Learning Manager ist nicht initialisiert!")
-                             # Optional: Hier abbrechen
-                             continue
-
-                        self.learning_manager.add_entry(
-                            doc_id=doc_id,
-                            content=transcript.strip(),
-                            metadata=metadata
-                        )
-                        # Kurze Pause, um UI nicht komplett zu blockieren
-                        time.sleep(0.05) 
-
-                    else:
-                        logger.info(f"Chunk {i+1}: Keine Sprache erkannt oder leerer Transcript.")
-
-                except Exception as transcribe_e:
-                    logger.error(f"Fehler beim Transkribieren von Chunk {i+1} aus {filepath}: {transcribe_e}", exc_info=True)
-                    # Versuche trotzdem, die temporäre Datei zu löschen, falls sie noch existiert
-                    if 'temp_chunk_path' in locals() and os.path.exists(temp_chunk_path):
-                         try:
-                             os.remove(temp_chunk_path)
-                             # ---> DEBUG-Log auskommentieren
-                             # logger.debug(f"Temporäre Chunk-Datei {temp_chunk_path} nach Fehler gelöscht.")
-                             # <--- Ende Änderung
-                         except Exception as del_e:
-                              logger.warning(f"Konnte temporäre Chunk-Datei {temp_chunk_path} nach Fehler nicht löschen: {del_e}")
-                    continue # Mit nächstem Chunk fortfahren
-                # --- Ende Workaround ---
-
-            logger.info(f"Verarbeitung von {filepath} abgeschlossen.")
-
-        except librosa.LibrosaError as load_error:
-             logger.error(f"Librosa Fehler beim Laden von {filepath}: {load_error}", exc_info=True)
-             # Hier könnte man this.error signalisieren
-        except Exception as e:
-            logger.error(f"Allgemeiner Fehler bei der Verarbeitung der Datei {filepath}: {e}", exc_info=True)
-            # Hier könnte man this.error signalisieren
-        
-    def stop(self):
-        """Signalisiert dem Thread, die Verarbeitung zu stoppen."""
-        logger.info("Stopp-Signal für AudioProcessingThread empfangen.")
-        self.running = False
+# === Ende AllSpidersRunThread ===

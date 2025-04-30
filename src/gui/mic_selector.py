@@ -85,4 +85,11 @@ class MicrophoneSelector(QDialog):
         if current_item:
             # Hole Daten mit neuer PyQt6 Syntax
             return current_item.data(Qt.ItemDataRole.UserRole)
+        return None
+        
+    def get_selected_device_name(self):
+        """Gibt den Namen des ausgewählten Mikrofons zurück"""
+        current_item = self.device_list.currentItem()
+        if current_item:
+            return current_item.text()
         return None 

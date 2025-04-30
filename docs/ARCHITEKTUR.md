@@ -49,6 +49,8 @@ JARVIS/
   - Unterstützt verschiedene LLM-Provider
   - Implementiert Kontext-Management
   - Handhabt Prompt-Engineering
+  - **NEU:** Integriert `IntentClassifier` zur Erkennung des Nutzer-Intents.
+  - **NEU:** Setzt dynamisch spezialisierte System-Prompts basierend auf dem Intent.
 
 - **LearningManager**: Wissensbasis
   - Speichert und verwaltet Kontext
@@ -77,9 +79,12 @@ JARVIS/
 
 ### Texteingabe
 1. Benutzer gibt Text ein
-2. TextProcessingThread verarbeitet den Text
-3. LLMManager generiert eine Antwort
-4. TTSManager konvertiert die Antwort in Sprache
+2. TextProcessingThread übergibt Text an `LLMManager`
+3. **NEU:** `LLMManager` ruft `IntentClassifier` auf, um den Intent zu bestimmen.
+4. **NEU:** `LLMManager` wählt den passenden System-Prompt aus und aktualisiert den Provider.
+5. `LLMManager` baut Kontext (DB, History) und ruft den LLM-Provider mit Prompt, Kontext und Nutzer-Input auf.
+6. `LLMManager` empfängt die Antwort.
+7. TTSManager konvertiert die Antwort in Sprache (falls nötig)
 
 ### Hörbuch-Import
 1. Benutzer wählt einen Ordner über den Button "Audiobücher lernen (Ordner)" in der GUI (`MainWindow`).

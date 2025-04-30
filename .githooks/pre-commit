@@ -1,0 +1,8 @@
+#!/bin/sh
+echo 'Running pre-commit checks...'
+# Fügen Sie hier Ihre tatsächlichen Checks ein, z.B. Linting oder Tests
+# Beispiel:
+# pylint src/ --exit-zero
+# pytest tests/ -v
+echo 'Pre-commit checks finished.'
+exit 0 # Wichtig: Exit Code 0, damit der Commit fortgesetzt wird 

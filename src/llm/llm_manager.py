@@ -13,11 +13,12 @@ import logging
 import re # Importiere Regex Modul
 from .providers.ollama_provider import OllamaProvider
 from .providers.base_provider import LLMProvider
-from data.models.hermes.hermes_runner import query_hermes
-from .providers.hermes_provider import HermesProvider
 import uuid
 import time
 from bs4 import BeautifulSoup
+from .search_manager import SearchManager
+from ..local_packages.nlp_processor import LocalNLPProcessor
+from ..intent_classifier import IntentClassifier # NEU: Importiere IntentClassifier
 
 # Logger für dieses Modul
 logger = logging.getLogger(__name__)
@@ -41,13 +42,29 @@ class LLMManager:
         self.prompts = self.load_prompts()
         
         # Initialisiere Sub-Manager mit Pfaden aus der Config
-        archive_dir = self.config.get("archive", "archive_dir", "data/conversations")
-        learning_dir = self.config.get("learning", "learning_dir", "data/learning")
-        safety_config_path = self.config.get("safety", "config_path", "config/safety_rules.json")
+        archive_dir = self.config.get("archive.archive_dir", "data/conversations")
+        learning_dir = self.config.get("learning.learning_dir", "data/learning")
+        safety_config_path = self.config.get("safety.config_path", "config/safety_rules.json")
         
         self.archive = ConversationArchive(archive_dir=archive_dir)
         self.learning = LearningManager(learning_dir=learning_dir)
         self.safety = SafetyManager(config_path=safety_config_path)
+        
+        # SearchManager und NLPProcessor instanziieren
+        self.search_manager = SearchManager(config=config) # Übergib config, falls später benötigt
+        self.nlp_processor = LocalNLPProcessor()
+        
+        # NEU: IntentClassifier instanziieren
+        self.intent_classifier = IntentClassifier()
+        
+        # NEU: Definiere spezialisierte System-Prompts (könnten auch aus prompts.json geladen werden)
+        self.specialized_prompts = {
+            "code": self.prompts.get("system_code", "Du bist JARVIS, ein Experte für Programmierung. Gib präzise Code-Beispiele und Erklärungen."),
+            "tech_support": self.prompts.get("system_tech", "Du bist JARVIS, ein Technikexperte. Hilf bei der Lösung von Hardware- und Softwareproblemen."),
+            "knowledge": self.prompts.get("system_knowledge", "Du bist JARVIS, ein Faktenassistent. Beantworte Wissensfragen klar und präzise."),
+            "chat": self.prompts.get("system_chat", "Du bist JARVIS, ein freundlicher Konversationspartner.")
+        }
+        self.default_system_prompt = self.prompts.get("system_default", "Du bist JARVIS, ein hilfreicher KI-Assistent. Antworte immer auf Deutsch.") # Fallback
         
         self.providers: Dict[str, LLMProvider] = {}
         self.current_provider: Optional[LLMProvider] = None
@@ -55,16 +72,25 @@ class LLMManager:
         # Initialisiere Provider
         self._init_providers()
         
+        # NEU: Hole den formatierten System-Prompt und setze ihn für alle Provider
+        formatted_system_prompt = self.get_system_prompt()
+        logger.info(f"Setze System-Prompt für alle initialisierten Provider: {formatted_system_prompt}")
+        for provider_name, provider_instance in self.providers.items():
+            if hasattr(provider_instance, 'update_system_prompt'):
+                provider_instance.update_system_prompt(formatted_system_prompt)
+            else:
+                logger.warning(f"Provider '{provider_name}' hat keine 'update_system_prompt' Methode.")
+
         self.learning_manager = self.learning
         self.online_mode = True  # Standardmäßig online
         
         # Debug-Logging für Wetter-Konfiguration
         logger.info("Lade Wetter-API-Konfiguration...")
-        self.weather_api_key = self.config.get('weather', 'api_key')
+        self.weather_api_key = self.config.get('weather.api_key')
         logger.info(f"Geladener API-Key: {self.weather_api_key}")
-        self.weather_city = self.config.get('weather', 'city', fallback='Dresden,01139,DE')
-        self.weather_units = self.config.get('weather', 'units', fallback='metric')
-        self.weather_language = self.config.get('weather', 'language', fallback='de')
+        self.weather_city = self.config.get('weather.city', fallback='Dresden,01139,DE')
+        self.weather_units = self.config.get('weather.units', fallback='metric')
+        self.weather_language = self.config.get('weather.language', fallback='de')
         self.weather_cache = {
             'data': None,
             'timestamp': None,
@@ -74,22 +100,50 @@ class LLMManager:
         logger.info("LLM Manager initialisiert")
         
     def _init_providers(self):
-        """Initialisiert alle verfügbaren LLM-Provider."""
-        # Ollama Provider
-        ollama_provider = OllamaProvider(self.config)
-        if ollama_provider.initialize():
-            self.providers["Ollama"] = ollama_provider
-            # Setze das Modell auf llama3:8b
-            ollama_provider.set_model("llama3:8b")
-            
-        # Hermes Provider
-        hermes_provider = HermesProvider(self.config)
-        self.providers["Hermes"] = hermes_provider
+        """Initialisiert den in der Konfiguration festgelegten LLM-Provider."""
+        provider_name = self.config.get("llm.provider", "Ollama") # Standard auf Ollama
+        logger.info(f"Versuche, LLM-Provider '{provider_name}' zu initialisieren...")
         
-        # Setze Ollama als Standard-Provider
-        self.current_provider = ollama_provider
-        logger.info(f"Standard-Provider gesetzt auf: {ollama_provider.name}")
+        provider_instance: Optional[LLMProvider] = None
+
+        if provider_name == "Ollama":
+            try:
+                ollama_provider = OllamaProvider(self.config)
+                if ollama_provider.initialize(): # initialize prüft jetzt Modell & lädt ggf. herunter
+                    self.providers["Ollama"] = ollama_provider
+                    provider_instance = ollama_provider
+                    logger.info(f"Ollama Provider erfolgreich initialisiert.")
+                else:
+                    logger.error("Initialisierung des Ollama Providers fehlgeschlagen.")
+            except Exception as e:
+                 logger.error(f"Ausnahme bei der Initialisierung des Ollama Providers: {e}", exc_info=True)
+
+        # elif provider_name == "Hermes": # Entfernt
+        #      try:
+        #         # Annahme: HermesProvider hat auch eine initialize() Methode
+        #         hermes_provider = HermesProvider(self.config)
+        #         # if hermes_provider.initialize(): # Auskommentiert, falls initialize nicht existiert/gebraucht wird
+        #         self.providers["Hermes"] = hermes_provider
+        #         provider_instance = hermes_provider
+        #         logger.info(f"Hermes Provider erfolgreich initialisiert (oder zumindest instanziiert).")
+        #         # else:
+        #         #    logger.error("Initialisierung des Hermes Providers fehlgeschlagen.")
+        #      except Exception as e:
+        #           logger.error(f"Ausnahme bei der Initialisierung des Hermes Providers: {e}", exc_info=True)
+                  
+        # Hier könnten weitere Provider hinzugefügt werden (elif provider_name == "XYZ": ...)
         
+        else:
+            logger.error(f"Unbekannter LLM-Provider in der Konfiguration: '{provider_name}'")
+
+        # Setze den initialisierten Provider als aktuellen Provider
+        if provider_instance:
+            self.current_provider = provider_instance
+            logger.info(f"Aktiver LLM-Provider gesetzt auf: {provider_instance.name}")
+        else:
+             logger.error("Kein LLM-Provider konnte erfolgreich initialisiert werden!")
+             self.current_provider = None # Explizit auf None setzen
+
     def get_available_providers(self) -> list:
         """Gibt eine Liste der verfügbaren Provider zurück."""
         return list(self.providers.keys())
@@ -210,72 +264,114 @@ class LLMManager:
         return self.learning.add_feedback(self.last_response_id, is_positive, feedback_text)
 
     def process_text(self, text: str) -> str:
-        """Verarbeitet einen Text und gibt eine Antwort zurück."""
-        logger.info(f"[LLMManager] Verarbeite Text: {text}...")
+        """Verarbeitet die Nutzereingabe, führt optionale Aktionen aus und fragt das LLM an."""
+        logger.info(f"Verarbeite Text: '{text[:50]}...'")
+
+        # 0. Safety Check für die Eingabe
+        is_safe, reason = self.safety.check_input(text)
+        if not is_safe:
+            logger.warning(f"Unsichere Eingabe erkannt und blockiert: {reason}")
+            self.add_message("user", text) # Füge die blockierte Nachricht trotzdem hinzu
+            self.add_message("assistant", reason) # Gib den Grund an den Nutzer zurück
+            return reason
         
-        if not text or not isinstance(text, str):
-            return "Entschuldigung, ich habe keine Eingabe erhalten."
-            
+        # NEU: 1. Intent Klassifizierung
+        intent = self.intent_classifier.classify_intent(text)
+        logger.info(f"Erkannter Intent: {intent}")
+
+        # NEU: 2. System-Prompt basierend auf Intent auswählen und setzen
+        selected_prompt = self.specialized_prompts.get(intent, self.default_system_prompt)
+        self.update_system_prompt(selected_prompt)
+        logger.info(f"System-Prompt für Intent '{intent}' gesetzt.")
+
+        # 1. Prüfe auf Wetter-Trigger
+        if any(trigger in text.lower() for trigger in ["wetter", "temperatur", "regen", "sonne"]):
+            logger.info("Wetter-Trigger erkannt. Versuche Wetterdaten abzurufen...")
+            weather_data = self.get_weather_data()
+            if weather_data:
+                weather_info = f"Das Wetter in {weather_data['city']} ist {weather_data['description']}. Die Temperatur beträgt {weather_data['temp']}°C, es fühlt sich {weather_data['feels_like']}°C an. Die Luftfeuchtigkeit beträgt {weather_data['humidity']}%, der Wind weht mit {weather_data['wind_speed']} m/s. Es ist {weather_data['description']}."
+                self.add_message("assistant", weather_info)
+            else:
+                self.add_message("assistant", "Entschuldigung, ich konnte die Wetterdaten nicht abrufen.")
+            return weather_info
+        
+        # NEU: Intent-basierte Verarbeitung
+        if intent == 'web_search' and 'query' in self.intent_classifier.classify_intent(text):
+            logger.info("Intent 'web_search' erkannt. Führe Suche durch...")
+            search_results = self.search_manager.web_search(text, max_results=3)
+            if search_results:
+                search_context = "\n\n--- Aktuelle Suchergebnisse ---\n"
+                for i, res in enumerate(search_results):
+                    search_context += f"{i+1}) Titel: {res.get('title', 'N/A')}\n   Snippet: {res.get('snippet', 'N/A')}\n   URL: {res.get('url', 'N/A')}\n"
+                search_context += "-- Ende Suchergebnisse ---\n"
+                self.add_message("assistant", search_context)
+                return search_context
+            else:
+                self.add_message("assistant", "Websuche ergab keine Treffer.")
+                return "Websuche ergab keine Treffer."
+        
+        # 3. Verarbeite den Text normal
         try:
-            # Normalisiere den Text
-            normalized_text = text.lower().strip()
+            # Hole relevanten Kontext aus der DB
+            db_context = self.learning.get_relevant_context(text)
             
-            # Prüfe auf Zeitabfrage
-            if any(keyword in normalized_text for keyword in ['wie spät', 'uhrzeit', 'aktuelle zeit']):
-                try:
-                    current_time = datetime.now().strftime("%H:%M Uhr")
-                    return f"Die aktuelle Uhrzeit ist {current_time}."
-                except Exception as time_error:
-                    logger.error(f"Fehler bei der Zeitabfrage: {str(time_error)}")
-                    return "Entschuldigung, ich konnte die aktuelle Uhrzeit nicht abrufen."
+            # Baue den gesamten Kontext mit der überarbeiteten build_context Methode
+            # Übergib Web-Kontext, DB-Kontext und aktuelle Konversationshistorie
+            final_combined_context = self.build_context(
+                web_search_context="",
+                db_context=db_context,
+                current_history=self.conversation_history # Übergib die aktuelle Historie
+            )
             
-            # Wenn keine Zeitabfrage, verarbeite normal
-            try:
-                # Hole relevanten Kontext
-                context = self.learning.get_relevant_context(text)
-                
-                # Generiere Antwort
-                response_data = self.current_provider.get_response(text, context=context)
-                
-                # Extrahiere Antwort
-                if isinstance(response_data, dict):
-                    response = response_data.get("response", "")
-                    model = response_data.get("model", self.current_provider.get_current_model())
-                else:
-                    response = response_data
-                    model = self.current_provider.get_current_model()
-                
-                # Generiere ID und speichere
-                response_id = f"response_{datetime.now().isoformat()}_{uuid.uuid4()}"
-                self.last_response_id = response_id
-                
-                # Metadaten
-                metadata = {
-                    "entry_type": "response",
-                    "query_text": text,
-                    "provider": self.current_provider.name,
-                    "model": model,
-                    "timestamp": datetime.now().isoformat(),
-                    "feedback_stats": json.dumps({"positive": 0, "negative": 0})
-                }
-                
-                # Speichere in LearningManager
-                self.learning.add_entry(doc_id=response_id, content=response, metadata=metadata)
-                
-                return response
-                
-            except Exception as e:
-                # Korrigierter Fehler: Verwende festen String statt self.log_prefix
-                error_msg = f"[LLMManager] Fehler bei der Textverarbeitung: {e}" 
-                logger.error(error_msg)
-                # Stelle sicher, dass traceback importiert ist (sollte oben sein)
-                import traceback 
-                logger.error(traceback.format_exc()) 
-                return "Entschuldigung, ich konnte deine Anfrage nicht verarbeiten."
-                
+            # 6. Kontext für LLM bauen (Web + DB + History)
+            # Baue den Kontext *nachdem* relevante Infos (Wetter, etc.) hinzugefügt wurden
+            context = self.build_context(web_search_context="", db_context=db_context, current_history=self.conversation_history)
+            
+            # 7. LLM Abfrage mit Kontext
+            logger.info("Sende Anfrage an LLM...")
+            start_time = time.time()
+            response_data = self.query_llm(text, context) # Nutze die neue Methode
+            end_time = time.time()
+            processing_time = end_time - start_time
+            logger.info(f"LLM-Antwort erhalten nach {processing_time:.2f} Sekunden.")
+
+            # Verarbeite die Antwort (extrahiere Text, etc.)
+            response_text = response_data.get("response", "")
+            response_id = response_data.get("response_id", str(uuid.uuid4())) # Generiere ID, falls nicht vorhanden
+            self.last_response_id = response_id # Speichere die ID der letzten Antwort
+            
+            # --- NEU/WIEDERHERGESTELLT: <think> Blöcke entfernen --- 
+            if isinstance(response_text, str):
+                # Verwende re.sub zum Entfernen des gesamten Blocks
+                # re.DOTALL lässt '.' auch Newlines matchen
+                cleaned_response = re.sub(r'<think>.*?</think>', '', response_text, flags=re.DOTALL | re.IGNORECASE)
+                # Entferne führende/folgende Leerzeichen, die übrig bleiben könnten
+                response_text = cleaned_response.strip()
+                logger.debug(f"Antwort nach Bereinigung: '{response_text[:100]}...'" ) # Debug Log hinzugefügt
+            # --- Ende Bereinigung ---
+            
+            # Metadaten
+            metadata = {
+                "entry_type": "response",
+                "query_text": text,
+                "provider": self.current_provider.name,
+                "model": self.current_provider.get_current_model(),
+                "timestamp": datetime.now().isoformat(),
+                "feedback_stats": json.dumps({"positive": 0, "negative": 0})
+            }
+            
+            # Speichere in LearningManager
+            self.learning.add_entry(doc_id=response_id, content=response_text, metadata=metadata)
+            
+            return response_text
+            
         except Exception as e:
-            error_msg = f"Fehler bei der Textverarbeitung: {str(e)}"
+            # Korrigierter Fehler: Verwende festen String statt self.log_prefix
+            error_msg = f"[LLMManager] Fehler bei der Textverarbeitung: {e}" 
             logger.error(error_msg)
+            # Stelle sicher, dass traceback importiert ist (sollte oben sein)
+            import traceback 
+            logger.error(traceback.format_exc()) 
             return "Entschuldigung, ich konnte deine Anfrage nicht verarbeiten."
             
     def clear_conversation(self):
@@ -290,7 +386,7 @@ class LLMManager:
             True wenn der Server läuft, False sonst
         """
         try:
-            response = requests.get(f"{self.config.get('ollama', 'url', default='http://localhost:11434')}/api/tags")
+            response = requests.get(f"{self.config.get('llm.ollama.url', default='http://localhost:11434')}/api/tags")
             return response.status_code == 200
         except:
             return False
@@ -308,44 +404,37 @@ class LLMManager:
         if len(self.conversation_history) > self.max_history:
             self.conversation_history = self.conversation_history[-self.max_history:]
     
-    def build_context(self, archive_history: List[Dict], learning_context: str) -> str:
-        """Baut den Kontext für die Antwortgenerierung - jetzt mit klareren Trennern."""
-        context_parts = [] # Geändert zu context_parts für Klarheit
-        
-        # Füge Archivkontext hinzu
-        if archive_history:
-            logger.debug(f"[LLMManager.build_context] Füge {len(archive_history)} Konversation(en) aus dem Archiv zum Kontext hinzu.")
-            context_parts.append("### Relevante frühere Gespräche ###") # Klarer Trenner
-            for conv in archive_history:
-                conv_id = conv.get('id', 'Unbekannte ID')
-                conv_score = conv.get('score', -1.0)
-                logger.debug(f"[LLMManager.build_context] - Archiv-Konv. ID: {conv_id}, Score: {conv_score:.4f}")
-                messages = conv.get("messages", [])[-3:] # Nutze die letzten 3 Nachrichten jeder Konversation
-                for msg in messages:
-                    role = msg.get('role', 'Unbekannt').capitalize()
-                    content = msg.get('content', '')
-                    context_parts.append(f"{role}: {content}")
-            context_parts.append("### Ende frühere Gespräche ###") # Klarer Trenner
-            context_parts.append("") # Leerzeile für Abstand
-            
-        # Füge Lernkontext hinzu
-        if learning_context and learning_context.strip(): # Prüfe, ob nicht leer oder nur Whitespace
-            logger.debug("[LLMManager.build_context] Füge Lernkontext hinzu.")
-            context_parts.append("### Relevante Lernerfahrungen ###") # Klarer Trenner
-            context_parts.append(learning_context) # Der String enthält bereits Formatierung
-            context_parts.append("### Ende Lernerfahrungen ###") # Klarer Trenner
+    def build_context(self, web_search_context: str, db_context: str, current_history: List[Dict]) -> str:
+        """Baut den Kontext für die Antwortgenerierung mit klarer Struktur und Priorisierung."""
+        context_parts = []
+        logger.debug("[LLMManager.build_context] Baue kombinierten Kontext...")
+
+        # 1. Websuche-Kontext (falls vorhanden)
+        if web_search_context and web_search_context.strip():
+            logger.debug("[LLMManager.build_context] Füge Websuche-Kontext hinzu.")
+            # Der web_search_context enthält bereits die Trenner
+            context_parts.append(web_search_context.strip()) 
             context_parts.append("") # Leerzeile für Abstand
         else:
-             logger.debug("[LLMManager.build_context] Kein relevanter Lernkontext gefunden oder leer.")
+            logger.debug("[LLMManager.build_context] Kein Websuche-Kontext vorhanden.")
 
-        # Füge aktuelle Konversation hinzu
-        if self.conversation_history:
-            logger.debug(f"[LLMManager.build_context] Füge {len(self.conversation_history)} Nachrichten aus aktueller Konversation hinzu.")
+        # 2. DB-Kontext (Lernerfahrungen) (falls vorhanden)
+        if db_context and db_context.strip(): # Prüfe, ob nicht leer oder nur Whitespace
+            logger.debug("[LLMManager.build_context] Füge DB-Kontext (Lernerfahrungen) hinzu.")
+            context_parts.append("### Relevante Informationen aus der Wissensbasis ###") # Klarer Trenner
+            context_parts.append(db_context) # Der String enthält bereits Formatierung?
+            context_parts.append("### Ende Informationen Wissensbasis ###") # Klarer Trenner
+            context_parts.append("") # Leerzeile für Abstand
+        else:
+             logger.debug("[LLMManager.build_context] Kein relevanter DB-Kontext gefunden oder leer.")
+
+        # 3. Aktuelle Konversation (falls vorhanden)
+        if current_history:
+            logger.debug(f"[LLMManager.build_context] Füge {len(current_history)} Nachrichten aus aktueller Konversation hinzu.")
             context_parts.append("### Aktuelles Gespräch (letzte Nachrichten) ###") # Klarer Trenner
-            # Nimm die letzten max_history/2 Paare oder max 6 Nachrichten?
-            # Nehmen wir die letzten 6 Nachrichten für den Prompt
-            history_limit = 6
-            relevant_history_messages = self.conversation_history[-history_limit:]
+            # Nimm die letzten N Nachrichten (wie bisher)
+            history_limit = 6 
+            relevant_history_messages = current_history[-history_limit:]
             for msg in relevant_history_messages:
                  role = msg.get('role', 'Unbekannt').capitalize()
                  content = msg.get('content', '')
@@ -355,8 +444,13 @@ class LLMManager:
         else:
             logger.debug("[LLMManager.build_context] Keine aktuelle Konversationshistorie vorhanden.")
 
-        context_str = "\n".join(context_parts)
-        logger.debug(f"[LLMManager.build_context] Kontextstring gebaut (Länge: {len(context_str)} Zeichen).")
+        # Früheren Archiv-Kontext vorerst weglassen, um Komplexität zu reduzieren
+        # Kann später wieder hinzugefügt werden, falls nötig.
+        logger.debug("[LLMManager.build_context] Hinweis: Frühere Gespräche (Archiv) werden aktuell nicht in den Kontext eingefügt.")
+
+        context_str = "\n".join(context_parts).strip() # Am Ende ggf. Leerzeichen entfernen
+        context_preview = context_str[:500].replace('\n', ' ')
+        logger.debug(f"[LLMManager.build_context] Kontextstring gebaut (Länge: {len(context_str)} Zeichen). Anfang: '{context_preview}...'")
         return context_str
         
     def is_german_response(self, text: str) -> bool:
@@ -415,24 +509,16 @@ class LLMManager:
             return None 
 
     def update_system_prompt(self, new_prompt: str):
-        """Aktualisiert den System-Prompt im Manager und im aktiven Provider."""
-        logger.info(f"Aktualisiere System-Prompt im LLMManager...")
-        # Hier könnten wir auch self.prompts aktualisieren und speichern,
-        # aber das Wichtigste ist, den Provider zu informieren.
-        if self.current_provider and hasattr(self.current_provider, 'update_system_prompt'):
-            try:
+        """Aktualisiert den System-Prompt für den aktuellen Provider."""
+        logger.info(f"Versuche System-Prompt zu aktualisieren: '{new_prompt[:50]}...'")
+        if self.current_provider:
+            if hasattr(self.current_provider, 'update_system_prompt'):
                 self.current_provider.update_system_prompt(new_prompt)
-                logger.info("System-Prompt erfolgreich an den aktiven Provider weitergegeben.")
-            except Exception as e:
-                logger.error(f"Fehler beim Weitergeben des System-Prompts an den Provider: {e}", exc_info=True)
-        elif not self.current_provider:
-            logger.warning("Kein aktiver Provider zum Aktualisieren des System-Prompts vorhanden.")
-        else: # Provider existiert, aber hat keine update_system_prompt Methode
-            logger.warning(f"Aktiver Provider '{self.current_provider.name}' unterstützt das Aktualisieren des System-Prompts nicht.")
-        
-    def ask_llm(self, prompt: str) -> str:
-        """Sendet einen einfachen Prompt an das LLM (für interne Zwecke)."""
-        return query_hermes(prompt) 
+                logger.info(f"System-Prompt für Provider '{self.current_provider.name}' aktualisiert.")
+            else:
+                logger.warning(f"Provider '{self.current_provider.name}' unterstützt 'update_system_prompt' nicht.")
+        else:
+            logger.warning("Kein aktiver Provider zum Aktualisieren des System-Prompts.")
 
     def set_online_mode(self, is_online: bool) -> bool:
         """Setzt den Online-Modus für den LLM-Manager.
@@ -558,3 +644,54 @@ class LLMManager:
         except Exception as e:
             logging.error(f"Fehler beim Web-Scraping von {url}: {str(e)}")
             return None 
+
+    def query_llm(self, user_input: str, context: str = "") -> Dict:
+        """Stellt eine Anfrage an den aktiven LLM-Provider mit dem aktuellen Konversationsverlauf.
+        
+        Args:
+            user_input (str): Die aktuelle Nutzereingabe.
+            context (str): Zusätzlicher Kontext (optional).
+
+        Returns:
+            Dict: Ein Dictionary mit der Antwort und Metadaten (z.B. response_id).
+                  Format: {'response': str, 'response_id': str, ...andere Provider-Daten}
+        """
+        if not self.current_provider:
+            logger.error("Kein LLM-Provider aktiv.")
+            return {"response": "[Fehler: Kein LLM-Provider initialisiert]", "response_id": None}
+
+        # Füge die aktuelle Benutzernachricht zum Verlauf hinzu (wird *vor* der Anfrage gemacht)
+        # Das Hinzufügen der Assistant-Antwort erfolgt *nach* Erhalt in process_text
+        self.add_message("user", user_input)
+
+        # Hole den aktuellen Konversationsverlauf für den Provider
+        # Stelle sicher, dass die History nicht zu lang wird
+        current_history = self.conversation_history[-self.max_history:]
+
+        logger.debug(f"Sende Anfrage an Provider '{self.current_provider.name}' mit Verlauf (letzte {len(current_history)} Nachrichten) und Kontext:")
+        # logger.debug(f"History: {current_history}")
+        # logger.debug(f"Context: {context[:100]}...") # Nur Anfang loggen
+
+        try:
+            # Rufe die get_response Methode des *Providers* auf
+            # Der Provider ist verantwortlich für das korrekte Formatieren der Anfrage
+            # (z.B. Einbau des System-Prompts, History, Context, User-Input)
+            response_data = self.current_provider.get_response(current_history, context=context) 
+            
+            if not isinstance(response_data, dict):
+                # Falls der Provider nur einen String zurückgibt, packe ihn in ein Dict
+                logger.warning(f"Provider '{self.current_provider.name}' gab nur einen String zurück. Erstelle Standard-Dict.")
+                response_data = {"response": str(response_data), "response_id": str(uuid.uuid4())}
+            elif "response" not in response_data:
+                 logger.error(f"Antwort-Dict vom Provider '{self.current_provider.name}' enthält keinen 'response'-Schlüssel.")
+                 response_data["response"] = "[Fehler: Ungültige Antwort vom Provider]"
+            
+            # Stelle sicher, dass eine response_id vorhanden ist
+            if "response_id" not in response_data or not response_data["response_id"]:
+                response_data["response_id"] = str(uuid.uuid4())
+
+            return response_data
+
+        except Exception as e:
+            logger.error(f"Fehler bei der Abfrage des LLM Providers '{self.current_provider.name}': {e}", exc_info=True)
+            return {"response": f"[Fehler bei der LLM-Anfrage: {e}]", "response_id": None} 

@@ -198,7 +198,7 @@ class PromptEditor(QDialog):
         layout.addLayout(buttons)
         
         dialog.setLayout(layout)
-        dialog.exec_()
+        dialog.exec()
         
     def save_new_rule(self, dialog, rule):
         """Speichert eine neue Regel"""
@@ -232,7 +232,7 @@ class PromptEditor(QDialog):
         layout.addLayout(buttons)
         
         dialog.setLayout(layout)
-        dialog.exec_()
+        dialog.exec()
         
     def save_edited_rule(self, dialog, item, new_text):
         """Speichert die bearbeitete Regel"""

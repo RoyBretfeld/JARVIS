@@ -1,7 +1,18 @@
 {
-    "ollama": {
-        "url": "http://localhost:11434",
-        "model": "llama3:8b"
+    "tts": {
+        "engine": "piper",
+        "speaker_wav_path": "",
+        "piper_executable_path": "piper/piper.exe", 
+        "model_path": "data/models/tts/de_DE-thorsten-high.onnx",
+        "config_path": "data/models/tts/de_DE-thorsten-high.onnx.json",
+        "use_tts": true 
+    },
+    "llm": {
+        "provider": "Ollama",
+        "ollama": {
+            "model": "qwen3:14b",
+            "url": "http://localhost:11434"
+        }
     },
     "audio": {
         "selected_microphone": 1,
@@ -20,33 +31,15 @@
         "task": "transcribe"
     },
     "learning": {
-        "dir": "data/learning"
-    },
-    "piper": {
-        "path": "piper/piper.exe",
-        "model": "data/models/tts/de_DE-thorsten-high.onnx",
-        "config": "data/models/tts/de_DE-thorsten-high.onnx.json"
-    },
-    "prompt": {
-        "system_prompt": "Du bist JARVIS, ein KI-Assistent. Antworte immer auf Deutsch, auch bei englischen Fragen. \nHalte deine Antworten kurz und direkt. \nVermeide lange Erkl\u00e4rungen und technische Details. \nBleibe nat\u00fcrlich und freundlich.\nErkl\u00e4re nicht immer wieder wer du bist und wo du vielleicht herkommst, ich hab Dich geschrieben und nur der Name ist mit Tony Starks Kreation gleich, ansonsten nichts."
-    },
-    "llm": {
-        "provider": "ollama",
-        "model": "llama3:8b",
-        "system_prompt": "Du bist JARVIS, ein KI-Assistent. Antworte immer auf Deutsch, auch bei englischen Fragen. Halte deine Antworten kurz und direkt. Vermeide lange Erkl\u00e4rungen und technische Details. Bleibe nat\u00fcrlich und freundlich."
-    },
-    "tts": {
-        "model": "de_DE-thorsten-high",
-        "speaker": 0,
-        "speed": 1.0,
-        "enable_tts": true,
-        "engine": "piper",
-        "speaker_wav_path": ""
+        "learning_dir": "data/learning"
     },
     "weather": {
         "api_key": "91ee2d32a13be6a0c1086c8539f8dcf5",
         "city": "Dresden,01139,DE",
         "units": "metric",
         "language": "de"
+    },
+    "user_profile": {
+        "display_name": "Roy"
     }
 }

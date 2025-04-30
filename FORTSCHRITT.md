@@ -441,3 +441,12 @@ Nachdem die Probleme mit der Whisper/cuDNN-Konfiguration behoben waren, kehrte d
 - Stadt: Dresden, 01139, DE
 - Einheiten: Metrisch
 - Sprache: Deutsch 
+
+## 2025as macht er hier-04-28: Verbesserungen Audiobuch-Import und UI
+
+*   **Fix (Audiobuch-Import):** Absturz beim Start des Imports behoben. Der direkte Zugriff auf den `QProgressDialog` aus dem Hintergrund-Thread (`AudioProcessingThread`) wurde durch die Verwendung von Qt Signalen (`progress_update`) und Slots (`update_audio_progress_dialog`) ersetzt, um die GUI sicher zu aktualisieren.
+*   **Feat (Chat):** Der tatsächliche Windows-Benutzername (via `getpass.getuser()`) wird jetzt anstelle des generischen "Benutzer:" im Chat angezeigt.
+*   **Feat (Task-Manager):** Grundlegende Task-Management-Funktionalität hinzugefügt (impliziert durch Git-Status).
+*   **Chore (UI):** Der Titel des Fortschrittsdialogs beim Audiobuch-Import wurde auf "Fortschritt" korrigiert.
+*   **Chore (Logging):** Detaillierte Debug-Logausgaben während der Chunk-Verarbeitung beim Audiobuch-Import wurden reduziert (auskommentiert), um die Übersichtlichkeit zu verbessern.
+*   **Docs (Sonstiges):** Diverse Bilder und Test-Skripte zum Repository hinzugefügt (impliziert durch Git-Status). 

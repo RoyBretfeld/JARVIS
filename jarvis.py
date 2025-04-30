@@ -9,6 +9,10 @@ from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QIcon
 from PyQt6.QtCore import QTimer
 
+# Füge Crochet hinzu und initialisiere es
+import crochet
+crochet.setup()
+
 # Füge den Projekt-Root zum Python-Pfad hinzu, damit src.* importiert werden kann
 project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)

@@ -8,6 +8,8 @@ import json      # Zum Lesen der Sample Rate aus der Config
 import re
 import threading
 import time
+import sounddevice as sd # NEU: Importiere sounddevice für Wiedergabe und Stopp
+import soundfile as sf # NEU: Importiere soundfile für WAV-Dateien
 # Importiere die Basisklasse
 from .base_tts_manager import BaseTTSManager
 
@@ -67,6 +69,9 @@ class PiperTTSManager(BaseTTSManager):
         except Exception as e:
             logger.warning(f"Konnte Sample Rate nicht aus {self.config_path} lesen: {e}")
             self.sample_rate = 22050 # Fallback
+            
+        # NEU: Statusvariable für aktive Wiedergabe
+        self._is_playing = False
 
         logger.info(f"PiperTTSManager ist bereit. Verwende piper.exe: {self.piper_exe_path}")
         self.is_ready = True # Setze auf True wenn alles okay ist
@@ -179,59 +184,34 @@ class PiperTTSManager(BaseTTSManager):
 
         return ' '.join(result)
 
-    def play_audio_async(self, wav_file: str):
-        """Spielt Audio asynchron ab"""
+    def play_audio_async_sd(self, wav_file: str):
+        """Spielt Audio asynchron mit sounddevice ab, um Stoppen zu ermöglichen."""
         def playback_thread():
-            temp_file_to_delete = None
+            temp_file_to_delete = wav_file
             try:
+                # Lese die WAV-Datei
+                data, fs = sf.read(wav_file, dtype='float32')
                 with self.playback_lock:
-                    if self.current_playback:
-                        try:
-                            # Versuche, die aktuelle Wiedergabe zu stoppen
-                            winsound.PlaySound(None, winsound.SND_PURGE)
-                            logger.debug("Vorherige Wiedergabe gestoppt.")
-                            # Gib die Datei für das Löschen frei
-                            # (Dies funktioniert nicht immer sofort, daher der finally-Block)
-                            if hasattr(self, '_current_temp_file') and self._current_temp_file:
-                                time.sleep(0.2) # Kurze Pause
-                                try:
-                                     os.unlink(self._current_temp_file)
-                                     logger.debug(f"Alte temporäre Datei gelöscht: {self._current_temp_file}")
-                                except Exception as del_e:
-                                     logger.warning(f"Konnte alte temporäre Datei nicht sofort löschen: {self._current_temp_file} - {del_e}")
-                        except Exception as stop_e:
-                            logger.warning(f"Fehler beim Stoppen der vorherigen Wiedergabe: {stop_e}")
-
-                    self.current_playback = wav_file
-                    self._current_temp_file = wav_file # Temporäre Datei merken
-                    temp_file_to_delete = wav_file # Merken für den finally Block
-
-                    logger.debug(f"Starte Wiedergabe von: {wav_file}")
-                    # Verwende SND_FILENAME und SND_NODEFAULT, um Systemklänge zu vermeiden
-                    # SND_ASYNC wird hier nicht benötigt, da der Thread selbst asynchron ist
-                    winsound.PlaySound(wav_file, winsound.SND_FILENAME | winsound.SND_NODEFAULT)
-                    logger.debug(f"Wiedergabe von {wav_file} beendet.")
+                    self._is_playing = True
+                logger.debug(f"Starte Wiedergabe von: {wav_file} mit sounddevice (Samplerate: {fs})")
+                # Spiele die Datei ab (blockierend innerhalb dieses Threads)
+                sd.play(data, fs)
+                # Warte, bis die Wiedergabe abgeschlossen ist ODER gestoppt wird
+                sd.wait()
+                logger.debug(f"Wiedergabe von {wav_file} beendet (oder gestoppt).")
 
             except Exception as e:
-                logger.error(f"Fehler bei der Wiedergabe von {wav_file}: {e}", exc_info=True)
+                logger.error(f"Fehler bei der Wiedergabe von {wav_file} mit sounddevice: {e}", exc_info=True)
             finally:
                 with self.playback_lock:
-                    self.current_playback = None
-                    self._current_temp_file = None
-                # Versuche, die temporäre Datei zu löschen, nachdem die Wiedergabe beendet ist
+                    self._is_playing = False
+                # Lösche die temporäre Datei
                 if temp_file_to_delete:
-                    time.sleep(0.1) # Kurze Wartezeit
                     try:
                         os.unlink(temp_file_to_delete)
                         logger.info(f"Temporäre WAV-Datei gelöscht: {temp_file_to_delete}")
-                    except PermissionError:
-                         logger.warning(f"Keine Berechtigung zum Löschen der temporären WAV-Datei (wird noch verwendet?): {temp_file_to_delete}")
-                         # Optional: Hier erneut versuchen oder markieren für späteren Cleanup
-                    except FileNotFoundError:
-                         logger.debug(f"Temporäre WAV-Datei wurde bereits gelöscht: {temp_file_to_delete}")
                     except Exception as e_del:
-                         logger.error(f"Unerwarteter Fehler beim Löschen der temporären WAV-Datei {temp_file_to_delete}: {e_del}")
-
+                        logger.error(f"Fehler beim Löschen der temporären WAV-Datei {temp_file_to_delete}: {e_del}")
 
         thread = threading.Thread(target=playback_thread)
         thread.daemon = True
@@ -327,10 +307,10 @@ class PiperTTSManager(BaseTTSManager):
 
             logger.info(f"Piper hat WAV-Datei erfolgreich erstellt: {temp_wav_file} (Größe: {os.path.getsize(temp_wav_file)} Bytes)")
 
-            # Spiele Audio asynchron ab (die Methode kümmert sich ums Löschen)
-            self.play_audio_async(temp_wav_file)
-            # WICHTIG: Die temporäre Datei darf hier NICHT gelöscht werden,
-            # da play_audio_async sie noch braucht und sie *nach* der Wiedergabe löscht.
+            # Starte asynchrone Wiedergabe mit sounddevice
+            self.play_audio_async_sd(temp_wav_file)
+            
+            # Die Temporärdatei wird im play_audio_async_sd Thread gelöscht
 
         except FileNotFoundError:
              logger.error(f"FEHLER: piper.exe nicht gefunden unter: {self.piper_exe_path}", exc_info=True)
@@ -339,11 +319,27 @@ class PiperTTSManager(BaseTTSManager):
                  try: os.unlink(temp_wav_file)
                  except Exception: pass
         except Exception as e:
-            logger.error(f"Unerwarteter Fehler in speak(): {e}", exc_info=True)
-            # Lösche temporäre Datei, falls sie erstellt wurde
+            logger.error(f"Unerwarteter Fehler während der TTS: {e}", exc_info=True)
+            # Hier die temporäre Datei löschen, falls sie noch existiert und erstellt wurde
             if temp_wav_file and os.path.exists(temp_wav_file):
-                try: os.unlink(temp_wav_file)
-                except Exception: pass
+                try:
+                    os.unlink(temp_wav_file)
+                    logger.info(f"Temporäre WAV-Datei nach Fehler gelöscht: {temp_wav_file}")
+                except Exception as del_e:
+                    logger.error(f"Fehler beim Löschen der temporären WAV-Datei nach Fehler: {del_e}")
+
+    def stop_playback(self):
+        """Stoppt die aktuelle Audiowiedergabe über sounddevice."""
+        with self.playback_lock:
+            if self._is_playing:
+                try:
+                    sd.stop()
+                    self._is_playing = False # Status zurücksetzen
+                    logger.info("Audiowiedergabe (sounddevice) gestoppt.")
+                except Exception as e:
+                    logger.error(f"Fehler beim Stoppen der sounddevice-Wiedergabe: {e}")
+            else:
+                logger.debug("Keine aktive Audiowiedergabe zum Stoppen gefunden.")
 
     # Die check_readiness Methode wird von der Basisklasse geerbt
     # def check_readiness(self) -> bool:
